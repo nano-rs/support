@@ -1,0 +1,18 @@
+## host
+hostname: nano-1
+nano host name: nano-1
+collected_utc: 2026-11-23T14:00:00Z
+install_dir: /home/nano/nano
+mode: single-node
+roles: app,ingest,clickhouse,postgres (single node)
+
+## cpus
+8
+
+## memory
+               total        used        free
+Mem:           31828       27410         512
+
+## time sync
+               Local time: Mon 2026-11-23 14:00:00 UTC
+System clock synchronized: yes

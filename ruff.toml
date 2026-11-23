@@ -1,0 +1,7 @@
+line-length = 120
+target-version = "py39"
+include = ["bin/support", "tests/**/*.py"]
+
+[lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "B904", "E741"]

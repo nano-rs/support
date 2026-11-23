@@ -1,0 +1,28 @@
+## version
+version	uptime_s	host
+26.10.4.207	1738	ch-example
+
+## errors-recent
+name	code	value	last_error_time	remote	last_error_message
+MEMORY_LIMIT_EXCEEDED	241	14	2026-11-23 13:30:55	0	(total) memory limit exceeded: would use 5.71 GiB (attempt to allocate chunk of 4.00 MiB), maximum: 5.70 GiB
+TOO_MANY_PARTS	252	3	2026-11-23 13:42:10	0	Too many parts (3001 with average size of 12.10 KiB) in table \'nanosiem.ocsf_logs_local (abcd)\'. Merges are processing significantly slower than inserts
+NETWORK_ERROR	210	6	2026-11-23 13:17:01	0	I/O error: Broken pipe, while writing to socket (192.0.2.10:8123 -> 192.0.2.11:42008)
+
+## parts-by-table
+database	table	active_parts	rows	on_disk	max_level	partitions
+nanosiem	ocsf_logs_local	3012	918223344	402.11 GiB	3	30
+nanosiem	signals	41	120044	31.20 MiB	5	9
+
+## parts-hot-partitions
+database	table	partition	active_parts
+nanosiem	ocsf_logs_local	20261123	2961
+
+## disks
+name	path	free	total	used_pct	type
+default	/var/lib/clickhouse/	29.00 GiB	500.00 GiB	94.2	Local
+
+## merges
+(no rows)
+
+## mutations-pending
+(no rows)

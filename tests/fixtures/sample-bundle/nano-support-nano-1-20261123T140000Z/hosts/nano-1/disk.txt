@@ -1,0 +1,7 @@
+## df -hT
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb1      ext4  500G  471G   29G  95% /var/lib/docker
+
+## data directories (is each its own mount?)
+what	path	is_mountpoint	mount_target	source	fstype	used	free
+docker root	/var/lib/docker	yes	/var/lib/docker	/dev/sdb1	ext4	471.0G	29.0G

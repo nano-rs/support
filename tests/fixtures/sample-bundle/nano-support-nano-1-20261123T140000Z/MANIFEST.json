@@ -1,0 +1,24 @@
+{
+  "tool": "nano support-bundle",
+  "tool_version": "1",
+  "created_utc": "2026-11-23T14:00:00Z",
+  "mode": "Compose single node",
+  "since_seconds": 86400,
+  "max_log_mb": 20,
+  "redactions": 31,
+  "contains_event_data": false,
+  "install_id": "inst_01jexampleexampleexample0",
+  "version": "2.0.34",
+  "edition": "enterprise",
+  "inventory": null,
+  "hosts": [
+    {
+      "name": "nano-1",
+      "local": true,
+      "ok": true,
+      "notes": []
+    }
+  ],
+  "notes": [],
+  "files": []
+}

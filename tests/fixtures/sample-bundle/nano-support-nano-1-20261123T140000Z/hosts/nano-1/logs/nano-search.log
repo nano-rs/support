@@ -1,0 +1,1 @@
+2026-11-23T13:10:03.123456789Z 2026-11-23T13:10:03.123456Z  INFO service{service.name="nanosiem-search" deployment_id= version="2.0.34"}: nanosiem_search: ClickHouse schema version OK

@@ -1,0 +1,14 @@
+## nano-api
+service=nano-api restarts=0 oom=false exit=0 started=2026-11-21T09:00:00.000000000Z finished=0001-01-01T00:00:00Z error=
+health=healthy failing_streak=0
+mem_limit=2147483648 nano_cpus=2000000000
+
+## nano-clickhouse
+service=clickhouse restarts=2 oom=true exit=137 started=2026-11-23T13:31:02.000000000Z finished=2026-11-23T13:30:58.000000000Z error=
+health=healthy failing_streak=0
+mem_limit=6442450944 nano_cpus=4000000000
+
+## nano-vector
+
+[stderr] template parsing error: template: :2:18: executing "" at <.State.Health>: map has no entry for key "Health"
+

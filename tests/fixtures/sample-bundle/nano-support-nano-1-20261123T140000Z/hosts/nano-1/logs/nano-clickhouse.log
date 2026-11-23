@@ -1,0 +1,3 @@
+2026-11-23T13:30:55.123456789Z 2026.11.23 13:30:55.120300 [ 812 ] {a1b2c3} <Error> executeQuery: Code: 241. DB::Exception: (total) memory limit exceeded: would use 5.71 GiB. (MEMORY_LIMIT_EXCEEDED)
+2026-11-23T13:30:58.123456789Z 2026.11.23 13:30:58.000000 [ 1 ] {} <Fatal> Application: Child process was terminated by signal 9 (KILL). If it is not done by 'forcestop' command or manually, the possible cause is OOM Killer
+2026-11-23T13:42:10.123456789Z 2026.11.23 13:42:10.441000 [ 77 ] {} <Error> nanosiem.ocsf_logs_local (abcd): Code: 252. DB::Exception: Too many parts (3001). Merges are processing significantly slower than inserts. (TOO_MANY_PARTS)

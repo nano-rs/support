@@ -1,0 +1,11 @@
+{
+  "host": "nano-1",
+  "hostname": "nano-1",
+  "epoch": 1795442400.0,
+  "mode": "single-node",
+  "roles": "",
+  "install_id": "inst_01jexampleexampleexample0",
+  "version": "2.0.34",
+  "edition": "enterprise",
+  "notes": []
+}

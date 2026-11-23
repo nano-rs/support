@@ -1,0 +1,3 @@
+collector	nano-1	2026-11-23T14:00:00Z
+host	skew_s	rtt_s	detail
+(single host: see host.txt 'time sync' for NTP state)

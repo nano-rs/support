@@ -1,0 +1,11 @@
+2026-11-23T13:51:05.123456789Z 2026-11-23T13:51:05.123456Z  INFO vector::app: Loading configs. paths=["/etc/vector"]
+2026-11-23T13:51:07.123456789Z 2026-11-23T13:51:07.123456Z ERROR vector::cli: Configuration error. error=Input "splunk_hec_ingst" for transform "drop_debug_events" doesn't match any components. internal_log_rate_limit=false
+2026-11-23T13:52:05.123456789Z 2026-11-23T13:52:05.123456Z  INFO vector::app: Loading configs. paths=["/etc/vector"]
+2026-11-23T13:52:07.123456789Z 2026-11-23T13:52:07.123456Z ERROR vector::cli: Configuration error. error=Input "splunk_hec_ingst" for transform "drop_debug_events" doesn't match any components. internal_log_rate_limit=false
+2026-11-23T13:53:05.123456789Z 2026-11-23T13:53:05.123456Z  INFO vector::app: Loading configs. paths=["/etc/vector"]
+2026-11-23T13:53:07.123456789Z 2026-11-23T13:53:07.123456Z ERROR vector::cli: Configuration error. error=Input "splunk_hec_ingst" for transform "drop_debug_events" doesn't match any components. internal_log_rate_limit=false
+2026-11-23T13:54:05.123456789Z 2026-11-23T13:54:05.123456Z  INFO vector::app: Loading configs. paths=["/etc/vector"]
+2026-11-23T13:54:07.123456789Z 2026-11-23T13:54:07.123456Z ERROR vector::cli: Configuration error. error=Input "splunk_hec_ingst" for transform "drop_debug_events" doesn't match any components. internal_log_rate_limit=false
+2026-11-23T13:55:05.123456789Z 2026-11-23T13:55:05.123456Z  INFO vector::app: Loading configs. paths=["/etc/vector"]
+2026-11-23T13:55:07.123456789Z 2026-11-23T13:55:07.123456Z ERROR vector::cli: Configuration error. error=Input "splunk_hec_ingst" for transform "drop_debug_events" doesn't match any components. internal_log_rate_limit=false
+2026-11-23T13:56:00.123456789Z nano-vector: not starting Vector yet (its ports refuse connections, so nothing is acknowledged): configuration does not build

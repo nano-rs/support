@@ -1,0 +1,188 @@
+{
+ "tool": "support",
+ "tool_version": "0.1.0",
+ "kind": "probes",
+ "collected_utc": "2026-11-23T14:00:05Z",
+ "host": "nano-1",
+ "since_seconds": 86400,
+ "redactions": 4,
+ "contains_event_data": false,
+ "probes": {
+  "containers": {
+   "ok": true,
+   "rows": [
+    {
+     "container": "nano-vector",
+     "service": "vector",
+     "state": "restarting",
+     "status": "Restarting (78) 9 seconds ago",
+     "restarts": 41,
+     "oom_killed": false,
+     "exit_code": 78,
+     "restarting": true,
+     "restart_policy": "unless-stopped"
+    },
+    {
+     "container": "nano-clickhouse",
+     "service": "clickhouse",
+     "state": "running",
+     "status": "Up 29 minutes (healthy)",
+     "restarts": 2,
+     "oom_killed": true,
+     "exit_code": 137,
+     "restarting": false,
+     "restart_policy": "unless-stopped"
+    },
+    {
+     "container": "nano-api",
+     "service": "nano-api",
+     "state": "running",
+     "status": "Up 2 days (healthy)",
+     "restarts": 0,
+     "oom_killed": false,
+     "exit_code": 0,
+     "restarting": false
+    }
+   ]
+  },
+  "health": {
+   "ok": true,
+   "rows": [
+    {
+     "service": "nano-api",
+     "url": "http://127.0.0.1:3000/health",
+     "ok": true,
+     "detail": "{\"status\":\"ok\"}"
+    },
+    {
+     "service": "vector-netns",
+     "url": "http://127.0.0.1:8686/health",
+     "ok": false,
+     "detail": "wget: can't connect to remote host (127.0.0.1): Connection refused"
+    }
+   ]
+  },
+  "vector-topology": {
+   "ok": false,
+   "text": "wget: can't connect to remote host (127.0.0.1): Connection refused",
+   "error": "Vector API did not answer (Vector is down or restarting, or its API is off)"
+  },
+  "ch-query-log-exceptions": {
+   "ok": true,
+   "rows": [
+    {
+     "exception_code": 241,
+     "error_name": "MEMORY_LIMIT_EXCEEDED",
+     "query_kind": "Select",
+     "user": "nanosiem_search",
+     "queries": 14,
+     "first_seen": "2026-11-23 13:28:01",
+     "last_seen": "2026-11-23 13:30:55"
+    },
+    {
+     "exception_code": 252,
+     "error_name": "TOO_MANY_PARTS",
+     "query_kind": "Insert",
+     "user": "nanosiem_ingest",
+     "queries": 3,
+     "first_seen": "2026-11-23 13:41:00",
+     "last_seen": "2026-11-23 13:42:10"
+    }
+   ]
+  },
+  "ch-query-log-slowest-shapes": {
+   "ok": true,
+   "rows": [
+    {
+     "normalized_query_hash": 1234567890123,
+     "query_kind": "Select",
+     "user": "nanosiem_search",
+     "queries": 22,
+     "p50_ms": 8100,
+     "p95_ms": 41000,
+     "max_ms": 58800,
+     "max_read_rows": 912000000,
+     "max_memory": 6120000000,
+     "failed": 14,
+     "exception_codes": [
+      241,
+      0
+     ]
+    }
+   ]
+  },
+  "vector-config-files": {
+   "ok": true,
+   "rows": [
+    {
+     "path": "00-base.toml",
+     "bytes": 4210,
+     "mode": "0o644",
+     "modified_utc": "2026-11-21 09:00:00"
+    },
+    {
+     "path": "02-hec-source.toml",
+     "bytes": 1880,
+     "mode": "0o644",
+     "modified_utc": "2026-11-21 09:00:00"
+    },
+    {
+     "path": "95-local-filter.toml",
+     "bytes": 162,
+     "mode": "0o644",
+     "modified_utc": "2026-11-23 13:50:40"
+    }
+   ]
+  },
+  "vector-config-local-changes": {
+   "ok": true,
+   "rows": [
+    {
+     "status": "??",
+     "path": "config/vector/95-local-filter.toml"
+    }
+   ]
+  },
+  "pg-migrations-failed": {
+   "ok": true,
+   "rows": []
+  },
+  "ch-migrations-recent": {
+   "ok": true,
+   "rows": [
+    {
+     "version": 397,
+     "name": "397_example",
+     "applied_at": "2026-11-21 09:00:01"
+    }
+   ]
+  },
+  "disk-free": {
+   "ok": true,
+   "rows": [
+    {
+     "filesystem": "/dev/sdb1",
+     "size": 536870912000,
+     "used": 505732399104,
+     "available": 31138512896,
+     "use_pct": 95,
+     "mounted_on": "/var/lib/docker"
+    }
+   ]
+  },
+  "pg-licensing-state": {
+   "ok": true,
+   "rows": [
+    {
+     "state": "grace_period",
+     "valid": true,
+     "tier": "enterprise",
+     "locked_reason": null,
+     "grace_ends_at": "2026-11-30 00:00:00+00",
+     "expires_at": null,
+     "last_checked_at": "2026-11-23 11:58:00+00"
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,2267 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""support: collect, load and query nano support bundles.
+
+  support collect [--install-dir ~/nano | --ssh USER@HOST | --kubernetes] [--since 24h]
+                  [--no-probes] [--out-dir DIR] [--yes]
+  support load BUNDLE [BUNDLE...] [--replace]
+  support query "SQL" [--format PrettyCompact]     (or @file.sql, or - for stdin)
+  support shell
+  support status
+  support down
+  support check BUNDLE                              (scan a bundle for secret-looking text)
+
+collect wraps nano's own support bundle tool (scripts/nano support-bundle) from
+YOUR install, so the version always matches your release and its redaction is
+the one nano ships. Optional live probes (health, migrations, Vector restarts
+and topology, ClickHouse parts, merges, mutations, errors and query_log totals
+with no query text, PostgreSQL pg_stat summaries, disk and memory) go through
+that same redaction. Nothing is written until you have seen a preview and said
+yes. Nothing is uploaded, ever: you decide where the file goes.
+
+load starts a throwaway ClickHouse in Docker on 127.0.0.1 (random port, random
+password in a 0600 file), parses the bundle into tables (logs, k8s_events,
+facts, probes) and prints starter queries. down removes it and its data.
+
+Python 3.9+ standard library only. Docker is needed for load/query/shell.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import datetime as _dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TOOL_VERSION = "0.1.0"
+
+# The throwaway ClickHouse. Pinned by tag AND digest (Docker Hub, clickhouse/clickhouse-server,
+# 25.8 LTS line). Bump both together, after checking the tag exists on Docker Hub.
+CH_IMAGE = ("clickhouse/clickhouse-server:25.8.33.6"
+            "@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77")
+CH_IMAGE_ENV = "SUPPORT_CLICKHOUSE_IMAGE"      # override for air-gapped mirrors
+CH_DB = "support"
+CH_USER = "support"
+STATE_DIR_ENV = "SUPPORT_STATE_DIR"
+
+# nano's bundle tool, as published in the public nano repository (used only on Kubernetes when
+# no copy from the pulled chart is given, and by the test suite).
+NANO_RAW_URL = "https://raw.githubusercontent.com/nano-rs/nano/v{version}/scripts/nano-support-bundle"
+BUNDLE_TOOL_NAME = "nano-support-bundle"
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+# user@host for --ssh: neither part may start with "-" (ssh would read it as an option).
+SAFE_SSH = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
+# --ssh-option keys that only change how the connection is checked, never run commands.
+SSH_OPTION_ALLOW = frozenset({"UserKnownHostsFile", "StrictHostKeyChecking", "IdentitiesOnly", "ConnectTimeout",
+                              "ServerAliveInterval", "ServerAliveCountMax", "HostKeyAlias", "Port",
+                              "CertificateFile", "HostKeyAlgorithms", "AddressFamily"})
+
+# nano's support bundle tool as published in each release (SHA-256 of scripts/nano-support-bundle
+# at the release tag of github.com/nano-rs/nano). A download is checked against this BEFORE it is
+# written or run; a release missing here is never downloaded (pass --bundle-tool instead).
+KNOWN_BUNDLE_TOOL_SHA256 = {
+    "2.0.25": "82c8e8de14c1f0e756b80358579f8fb35363a0038f1a162cb80fb0dcb467671e",
+    "2.0.26": "82c8e8de14c1f0e756b80358579f8fb35363a0038f1a162cb80fb0dcb467671e",
+    "2.0.27": "08578ccefeca4303f61b4c5fab38977e7501835802e6c44464426828295cf314",
+    "2.0.28": "08578ccefeca4303f61b4c5fab38977e7501835802e6c44464426828295cf314",
+    "2.0.29": "08578ccefeca4303f61b4c5fab38977e7501835802e6c44464426828295cf314",
+    "2.0.30": "08578ccefeca4303f61b4c5fab38977e7501835802e6c44464426828295cf314",
+    "2.0.31": "08578ccefeca4303f61b4c5fab38977e7501835802e6c44464426828295cf314",
+    "2.0.32": "0a8912c4814bc81061908c9d8296c9f45990b550ba9c7c9a17dbc1e3708eeb61",
+    "2.0.33": "0a8912c4814bc81061908c9d8296c9f45990b550ba9c7c9a17dbc1e3708eeb61",
+    "2.0.34": "0a8912c4814bc81061908c9d8296c9f45990b550ba9c7c9a17dbc1e3708eeb61",
+}
+
+# Reading bundles: they are untrusted input. Limits against decompression and nesting bombs.
+MAX_MEMBER_BYTES = 256 * 2**20
+MAX_TOTAL_BYTES = int(os.environ.get("SUPPORT_MAX_BUNDLE_BYTES", str(2 * 2**30)))
+MAX_MEMBERS = 50000
+MAX_NESTING = 2
+
+
+# ------------------------------------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------------------------------------
+
+def eprint(*a, **k) -> None:
+    print(*a, file=sys.stderr, **k)
+
+
+def die(msg: str, code: int = 2) -> "None":
+    eprint(f"support: {msg}")
+    sys.exit(code)
+
+
+def run(cmd: list, timeout: int = 120, input_text: str | None = None) -> tuple:
+    """(returncode, stdout, stderr). Never raises."""
+    try:
+        p = subprocess.run(cmd, input=input_text, capture_output=True, text=True, timeout=timeout,
+                           errors="replace", **({} if input_text is not None else {"stdin": subprocess.DEVNULL}))
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as err:
+        return 126, "", str(err)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return str(n)
+
+
+def parse_since(text: str) -> int:
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", text or "")
+    if not m:
+        raise argparse.ArgumentTypeError("use a duration such as 90m, 24h or 3d")
+    value = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    if not 60 <= value <= 30 * 86400:
+        raise argparse.ArgumentTypeError("--since must be between 1m and 30d")
+    return value
+
+
+def utc_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ask(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        eprint(f"{question} [y/N] y (--yes)")
+        return True
+    if not sys.stdin.isatty():
+        eprint(f"{question} [y/N] no terminal to ask on: answering no. Re-run on a terminal, or pass --yes "
+               "after you have reviewed the preview.")
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def state_dir() -> str:
+    d = os.environ.get(STATE_DIR_ENV) or os.path.join(os.path.expanduser("~"), ".nano-support")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    return d
+
+
+def write_private(path: str, data: str) -> None:
+    """Write a file only the current user can read (0600), replacing any old one."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(data)
+
+
+# ------------------------------------------------------------------------------------------------
+# nano's bundle tool: find it, load it, reuse its redaction (never a copy of our own)
+# ------------------------------------------------------------------------------------------------
+
+def load_bundle_module(path: str):
+    """Import nano's nano-support-bundle script as a module (it is a plain Python file)."""
+    loader = importlib.machinery.SourceFileLoader("nano_support_bundle", path)
+    spec = importlib.util.spec_from_loader("nano_support_bundle", loader)
+    if spec is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    for name in ("Redactor", "read_env", "scrub_payload"):
+        if not hasattr(module, name):
+            raise ImportError(f"{path} has no {name}: not a nano support bundle tool")
+    return module
+
+
+def find_install_tool(install_dir: str) -> str | None:
+    p = os.path.join(install_dir, "scripts", BUNDLE_TOOL_NAME)
+    return p if os.path.isfile(p) else None
+
+
+def install_version(install_dir: str) -> str:
+    env_path = os.path.join(install_dir, ".env")
+    try:
+        with open(env_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("NANO_VERSION="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def known_release_of(digest: str) -> list:
+    return sorted((v for v, d in KNOWN_BUNDLE_TOOL_SHA256.items() if d == digest),
+                  key=lambda v: tuple(int(x) for x in v.split(".")))
+
+
+def download_bundle_tool(version: str, dest_dir: str, fetch=None) -> tuple:
+    """Fetch nano's tool for one release, verified against the pinned SHA-256 BEFORE anything is
+    written or run. (path, sha256). Raises ValueError for an unknown release or a mismatch."""
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError(f"not a release version: {version!r}")
+    expected = KNOWN_BUNDLE_TOOL_SHA256.get(version)
+    if not expected:
+        raise ValueError(f"nano {version} has no pinned SHA-256 in this tool: pass --bundle-tool PATH "
+                         "(nano/scripts/nano-support-bundle from the chart you pulled), or update support")
+    url = NANO_RAW_URL.format(version=version)
+    if fetch is None:
+        def fetch(u):
+            with urllib.request.urlopen(u, timeout=60) as resp:
+                return resp.read(8 * 2**20)
+    data = fetch(url)
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != expected:
+        raise ValueError(f"{url}: SHA-256 {digest} does not match the pinned {expected}; not run")
+    path = os.path.join(dest_dir, f"{BUNDLE_TOOL_NAME}-{version}")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return path, digest
+
+
+# ------------------------------------------------------------------------------------------------
+# Live probes (all output goes through nano's Redactor before it is kept)
+# ------------------------------------------------------------------------------------------------
+
+def ch_probe_queries(since_s: int) -> list:
+    """ClickHouse system tables. query_log is aggregated: no query text, no literals."""
+    s = int(since_s)
+    return [
+        ("ch-parts-by-partition", "SELECT database, table, partition, count() AS active_parts, sum(rows) AS rows, "
+                                  "sum(bytes_on_disk) AS bytes_on_disk FROM system.parts WHERE active "
+                                  "GROUP BY database, table, partition ORDER BY active_parts DESC LIMIT 50"),
+        ("ch-merges", "SELECT database, table, round(elapsed) AS elapsed_s, round(progress, 3) AS progress, "
+                      "num_parts, total_size_bytes_compressed, memory_usage, is_mutation, merge_type "
+                      "FROM system.merges ORDER BY elapsed DESC LIMIT 50"),
+        ("ch-mutations", "SELECT database, table, mutation_id, create_time, is_done, parts_to_do, "
+                         "latest_fail_time, substring(replaceAll(latest_fail_reason, '\\n', ' '), 1, 240) "
+                         "AS latest_fail_reason FROM system.mutations "
+                         f"WHERE NOT is_done OR create_time > now() - INTERVAL {s} SECOND "
+                         "ORDER BY create_time DESC LIMIT 50"),
+        ("ch-errors", "SELECT name, code, value, last_error_time, "
+                      "substring(replaceAll(last_error_message, '\\n', ' '), 1, 240) AS last_error_message "
+                      f"FROM system.errors WHERE last_error_time > now() - INTERVAL {s} SECOND "
+                      "ORDER BY last_error_time DESC LIMIT 100"),
+        ("ch-query-log-by-hour", "SELECT toStartOfHour(event_time) AS hour, type, query_kind, user, "
+                                 "exception_code, count() AS queries, round(avg(query_duration_ms)) AS avg_ms, "
+                                 "max(query_duration_ms) AS max_ms, sum(read_rows) AS read_rows, "
+                                 "sum(read_bytes) AS read_bytes, max(memory_usage) AS max_memory "
+                                 f"FROM system.query_log WHERE event_time > now() - INTERVAL {s} SECOND "
+                                 "AND type != 'QueryStart' GROUP BY hour, type, query_kind, user, exception_code "
+                                 "ORDER BY hour, queries DESC LIMIT 2000"),
+        ("ch-query-log-slowest-shapes", "SELECT normalized_query_hash, any(query_kind) AS query_kind, any(user) AS user, "
+                                        "count() AS queries, quantile(0.5)(query_duration_ms) AS p50_ms, "
+                                        "quantile(0.95)(query_duration_ms) AS p95_ms, max(query_duration_ms) AS max_ms, "
+                                        "max(read_rows) AS max_read_rows, max(memory_usage) AS max_memory, "
+                                        "countIf(exception_code != 0) AS failed, "
+                                        "groupUniqArray(10)(exception_code) AS exception_codes "
+                                        f"FROM system.query_log WHERE event_time > now() - INTERVAL {s} SECOND "
+                                        "AND type != 'QueryStart' GROUP BY normalized_query_hash "
+                                        "ORDER BY p95_ms DESC LIMIT 30"),
+        ("ch-query-log-exceptions", "SELECT exception_code, errorCodeToName(exception_code) AS error_name, "
+                                    "query_kind, user, count() AS queries, min(event_time) AS first_seen, "
+                                    "max(event_time) AS last_seen FROM system.query_log "
+                                    f"WHERE event_time > now() - INTERVAL {s} SECOND AND exception_code != 0 "
+                                    "GROUP BY exception_code, query_kind, user ORDER BY queries DESC LIMIT 100"),
+        ("ch-disks", "SELECT name, path, free_space, total_space, keep_free_space, type FROM system.disks"),
+        ("ch-memory", "SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN "
+                      "('OSMemoryTotal', 'OSMemoryAvailable', 'CGroupMemoryTotal', 'CGroupMemoryUsed', "
+                      "'MemoryResident', 'MaxPartCountForPartition', 'Uptime') ORDER BY metric"),
+        ("ch-settings", "SELECT name, value, changed FROM system.server_settings WHERE name IN "
+                        "('max_server_memory_usage', 'max_server_memory_usage_to_ram_ratio', "
+                        "'background_pool_size', 'max_concurrent_queries', 'max_partitions_per_insert_block') "
+                        "OR (changed AND name LIKE '%memory%')"),
+        ("ch-merge-tree-settings", "SELECT name, value FROM system.merge_tree_settings WHERE name IN "
+                                   "('parts_to_delay_insert', 'parts_to_throw_insert', 'max_parts_in_total')"),
+        ("ch-migrations", "SELECT * FROM system.tables WHERE database = currentDatabase() AND name LIKE '%migrations%' "
+                          "FORMAT Null"),  # existence probe only; the next probe reads it
+    ]
+
+
+CH_MIGRATIONS_SQL = ("SELECT * FROM {table} ORDER BY 1 DESC LIMIT 15")
+
+PG_PROBE_QUERIES = [
+    ("pg-migrations-recent", "SELECT version, description, success, installed_on, execution_time "
+                             "FROM _sqlx_migrations ORDER BY version DESC LIMIT 15"),
+    ("pg-migrations-failed", "SELECT version, description, installed_on FROM _sqlx_migrations "
+                             "WHERE NOT success ORDER BY version"),
+    ("pg-stat-database", "SELECT datname, numbackends, xact_commit, xact_rollback, deadlocks, conflicts, "
+                         "temp_files, temp_bytes, blks_read, blks_hit, stats_reset FROM pg_stat_database "
+                         "WHERE datname = current_database()"),
+    ("pg-connections", "SELECT state, wait_event_type, count(*) AS connections, "
+                       "max(now() - state_change) AS oldest_in_state FROM pg_stat_activity "
+                       "WHERE datname = current_database() GROUP BY 1, 2 ORDER BY 3 DESC"),
+    ("pg-max-connections", "SELECT current_setting('max_connections') AS max_connections"),
+    ("pg-locks-waiting", "SELECT locktype, mode, count(*) AS waiting FROM pg_locks WHERE NOT granted "
+                         "GROUP BY 1, 2 ORDER BY 3 DESC"),
+    ("pg-tables-dead-tuples", "SELECT relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoanalyze "
+                              "FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 15"),
+    ("pg-database-size", "SELECT pg_database_size(current_database()) AS bytes"),
+    # The cached license state (no raw response: it is the license service's full answer).
+    ("pg-licensing-state", "SELECT status AS state, valid, tier, locked_reason, grace_ends_at, expires_at, "
+                          "last_checked_at, last_heartbeat_at, updated_at FROM license_status"),
+]
+
+# Health endpoints, asked from inside the containers (no credentials needed). The jobs port is
+# JOBS_PORT from the container's own environment (3003 on Compose). Vector's image has no HTTP
+# client, so Vector is asked from vector-netns, which shares its network namespace.
+HEALTH_PROBES = [
+    (("nano-api", "api"), "http://127.0.0.1:3000/health"),
+    (("nano-api", "api"), "http://127.0.0.1:3000/ready"),
+    (("nano-search", "search"), "http://127.0.0.1:3002/health"),
+    (("nano-search", "search"), "http://127.0.0.1:3002/ready"),
+    (("nano-jobs", "jobs"), "http://127.0.0.1:${JOBS_PORT:-3001}/health"),
+    (("vector-netns", "vector"), "http://127.0.0.1:8686/health"),
+]
+
+VECTOR_TOPOLOGY_GQL = ('{"query":"{ components(first: 500) { edges { node { componentId componentType '
+                       '__typename } } } }"}')
+
+
+TSV_ESCAPES = {"t": "\t", "n": " ", "r": " ", "\\": "\\", "'": "'", "0": ""}
+LITERAL_RE = re.compile(r"'(?:[^'\\\r\n]|\\.)*'")
+# Columns of system tables that can quote an event's value or a query's literal.
+FREE_TEXT_COLUMN = re.compile(r"(?i)(message|reason|exception|error)$")
+
+
+def tsv_unescape(value: str) -> str:
+    """ClickHouse TSV escapes (\\t, \\n, \\', \\\\) back to text."""
+    return re.sub(r"\\(.)", lambda m: TSV_ESCAPES.get(m.group(1), m.group(1)), value)
+
+
+def scrub_free_text(rows: list, sb) -> list:
+    """Remove every quoted literal (and long payload) from free-text columns: an error message can
+    quote a value from an event or a query ('alice@example.com', WHERE user = 'x')."""
+    for row in rows:
+        for k, v in list(row.items()):
+            if isinstance(v, str) and FREE_TEXT_COLUMN.search(k):
+                v = LITERAL_RE.sub("'[REDACTED:literal]'", v)
+                row[k] = sb.scrub_payload(v) if sb is not None else v
+    return rows
+
+
+def ch_rows(text: str, sb) -> list:
+    return scrub_free_text(tsv_rows(text, unescape=True), sb)
+
+
+def tsv_rows(text: str, unescape: bool = False) -> list:
+    """TSVWithNames (ClickHouse) or psql -A -F tab output into a list of dicts."""
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("[stderr]")]
+    lines = [ln for ln in lines if not re.fullmatch(r"\(\d+ rows?\)", ln.strip())]
+    if not lines:
+        return []
+    header = lines[0].split("\t")
+    rows = []
+    for ln in lines[1:]:
+        cells = ln.split("\t")
+        if len(cells) != len(header):
+            rows.append({"_line": ln})
+            continue
+        rows.append({h: coerce(tsv_unescape(c) if unescape else c) for h, c in zip(header, cells)})
+    return rows
+
+
+def coerce(value: str):
+    if re.fullmatch(r"-?\d{1,18}", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+(e[-+]?\d+)?", value, re.I):
+        with contextlib.suppress(ValueError):
+            return float(value)
+    if value in ("t", "true"):
+        return True
+    if value in ("f", "false"):
+        return False
+    if value in ("\\N", ""):
+        return None
+    return value
+
+
+def scrub_error_text(text: str, sb) -> str:
+    """A failed probe's error output: no quoted literals, no payload, capped."""
+    lines = [sb.scrub_payload(LITERAL_RE.sub("'[REDACTED:literal]'", ln)) for ln in text.splitlines()]
+    return "\n".join(lines)[:1000]
+
+
+def redact_tree(obj, redact):
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {k: redact_tree(v, redact) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_tree(v, redact) for v in obj]
+    if isinstance(obj, (int, float, bool)) or obj is None:
+        return obj
+    return redact(str(obj))
+
+
+class Prober:
+    """Runs read-only probes on a Compose host, reusing nano's own ComposeHost plumbing."""
+
+    def __init__(self, sb, install_dir: str, since_s: int, redact):
+        self.sb = sb
+        self.since_s = since_s
+        self.redact = redact
+        self.out: dict = {}
+        self.host = sb.ComposeHost(install_dir, since_s, 1, redact)
+        self.host.discover()
+
+    def keep(self, name: str, ok: bool, rows=None, text: str | None = None, error: str | None = None) -> None:
+        doc = {"ok": bool(ok)}
+        if rows is not None:
+            doc["rows"] = rows
+        if text is not None:
+            doc["text"] = text
+        if error:
+            doc["error"] = error
+        # Redact every string leaf first (a secret holding " or \\ is escaped once serialized, and
+        # the redactor knows only its raw form), then the serialized form again as a second net.
+        doc = redact_tree(doc, self.redact)
+        red = self.redact(json.dumps(doc, default=str))
+        try:
+            self.out[name] = json.loads(red)
+        except ValueError:
+            self.out[name] = {"ok": ok, "text": self.redact(json.dumps(doc, default=str))[:20000],
+                              "error": "redaction changed the JSON shape; kept as text"}
+
+    def sh(self, name: str, cmd: list, timeout: int = 30) -> None:
+        rc, out, err = run(cmd, timeout=timeout)
+        self.keep(name, rc == 0, text=(out + (("\n[stderr] " + err) if err.strip() else ""))[-20000:])
+
+    def containers(self) -> None:
+        # docker inspect JSON, not a Go template: templates that touch .State.Health fail on
+        # containers without a health check (Vector among them) on recent Docker releases.
+        names = [c["name"] for c in self.host.containers]
+        rc, out, err = run(["docker", "inspect", *names], timeout=60) if names else (1, "[]", "no containers")
+        try:
+            items = json.loads(out) if rc == 0 else []
+        except ValueError:
+            items = []
+        by_name = {str(i.get("Name", "")).lstrip("/"): i for i in items if isinstance(i, dict)}
+        rows = []
+        for c in self.host.containers:
+            i = by_name.get(c["name"], {})
+            st = i.get("State") or {}
+            health = st.get("Health") or {}
+            rows.append({"container": c["name"], "service": c["service"], "state": c["state"], "status": c["status"],
+                         "image": c["image"], "restarts": i.get("RestartCount"), "oom_killed": st.get("OOMKilled"),
+                         "exit_code": st.get("ExitCode"), "error": st.get("Error") or "",
+                         "started_at": st.get("StartedAt"), "finished_at": st.get("FinishedAt"),
+                         "restarting": st.get("Restarting"), "health": health.get("Status", ""),
+                         "failing_streak": health.get("FailingStreak"),
+                         "mem_limit_bytes": (i.get("HostConfig") or {}).get("Memory"),
+                         "restart_policy": ((i.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name")})
+        self.keep("containers", rc == 0, rows=rows, error=None if rc == 0 else err[:500])
+
+    def health(self) -> None:
+        rows = []
+        for services, url in HEALTH_PROBES:
+            name = next((n for n in (self.host.container(x) for x in services) if n), None)
+            if not name:
+                rows.append({"service": services[0], "url": url, "ok": False, "detail": "container not running"})
+                continue
+            script = (f'u="{url}"; printf "%s\\n" "$u"; out=$(wget -qO- -T 5 "$u" 2>&1 || curl -fsS -m 5 "$u" 2>&1); '
+                      'rc=$?; printf "%s" "$out" | head -c 2000; exit $rc')
+            rc, out, err = run(["docker", "exec", name, "sh", "-c", script], timeout=20)
+            resolved, _, body = out.partition("\n")  # the URL as the container expanded it (JOBS_PORT)
+            rows.append({"service": services[0], "via": name, "url": resolved.strip() or url, "ok": rc == 0,
+                         "detail": (body or err).strip()[:1500]})
+        self.keep("health", True, rows=rows)
+
+    def vector(self) -> None:
+        # Vector's image has no HTTP client. On Compose it shares the network namespace of the small
+        # vector-netns container, which does, and which keeps running while Vector restarts.
+        name = self.host.container("vector-netns") or self.host.container("vector")
+        if not name:
+            self.keep("vector-topology", False, error="no running vector or vector-netns container")
+            return
+        script = ("(wget -qO- -T 5 --header 'Content-Type: application/json' --post-data "
+                  f"{shlex.quote(VECTOR_TOPOLOGY_GQL)} http://127.0.0.1:8686/graphql || "
+                  "curl -fsS -m 5 -H 'Content-Type: application/json' -d "
+                  f"{shlex.quote(VECTOR_TOPOLOGY_GQL)} http://127.0.0.1:8686/graphql) 2>&1")
+        rc, out, err = run(["docker", "exec", name, "sh", "-c", script], timeout=20)
+        try:
+            rows = [{"component_id": e["node"].get("componentId"), "kind": e["node"].get("componentType"),
+                     "type": e["node"].get("__typename")}
+                    for e in json.loads(out)["data"]["components"]["edges"]]
+            self.keep("vector-topology", True, rows=rows)
+        except (ValueError, KeyError, TypeError):
+            self.keep("vector-topology", False, text=(out + err)[:4000],
+                      error="Vector API did not answer (Vector is down or restarting, or its API is off)")
+        rc, out, err = run(["docker", "exec", name, "sh", "-c",
+                            "(wget -qO- -T 5 http://127.0.0.1:9598/metrics || "
+                            "curl -fsS -m 5 http://127.0.0.1:9598/metrics) 2>&1"], timeout=30)
+        if rc == 0 and out.strip():
+            text = self.sb.filter_vector_metrics(out) if hasattr(self.sb, "filter_vector_metrics") else out
+            self.keep("vector-metrics", True, rows=parse_prometheus(text)[:5000])
+        else:
+            self.keep("vector-metrics", False, error=(out + err).strip()[:500] or "no answer on :9598")
+
+    def vector_files(self) -> None:
+        """Names, sizes and times of Vector's config files (never their contents), and which ones
+        are not part of the release (git status on a git install)."""
+        base = os.path.join(self.host.d, "config", "vector")
+        rows = []
+        for root, dirs, names in os.walk(base):
+            rel_root = os.path.relpath(root, base)
+            dirs[:] = [d for d in dirs if d not in ("certs", "backup", ".nano") and not
+                       (rel_root == "." and d == "dynamic")]
+            for n in sorted(names):
+                full = os.path.join(root, n)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                rows.append({"path": os.path.normpath(os.path.join(rel_root, n)), "bytes": st.st_size,
+                             "mode": oct(st.st_mode & 0o777), "modified_utc": _dt.datetime.fromtimestamp(
+                                 st.st_mtime, _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")})
+        self.keep("vector-config-files", os.path.isdir(base), rows=rows,
+                  error=None if os.path.isdir(base) else f"{base} not found")
+        if os.path.isdir(os.path.join(self.host.d, ".git")):
+            rc, out, err = run(["git", "-C", self.host.d, "status", "--porcelain", "--", "config/vector"], timeout=30)
+            changed = [{"status": ln[:2].strip(), "path": ln[3:]} for ln in out.splitlines() if ln.strip()]
+            self.keep("vector-config-local-changes", rc == 0, rows=changed, error=None if rc == 0 else err[:300])
+
+    def clickhouse(self) -> None:
+        if not self.host.container("clickhouse"):
+            self.keep("clickhouse", False, error="clickhouse is not running on this host")
+            return
+        migrations_table = None
+        for name, sql in ch_probe_queries(self.since_s):
+            if name == "ch-migrations":
+                ok, text = self.host.ch_sql("SELECT database, name FROM system.tables WHERE name IN "
+                                            "('_migrations', 'schema_migrations', 'nano_migrations') "
+                                            "AND database NOT IN ('system') LIMIT 1")
+                rows = tsv_rows(text) if ok else []
+                if rows and isinstance(rows[0], dict) and rows[0].get("name"):
+                    migrations_table = f"`{rows[0]['database']}`.`{rows[0]['name']}`"
+                continue
+            ok, text = self.host.ch_sql(sql)
+            # Error and exception columns can quote an event's value or a query literal.
+            self.keep(name, ok, rows=ch_rows(text, self.sb) if ok else None,
+                      error=None if ok else scrub_error_text(text, self.sb))
+        if migrations_table and re.fullmatch(r"`[A-Za-z0-9_]+`\.`[A-Za-z0-9_]+`", migrations_table):
+            ok, text = self.host.ch_sql(CH_MIGRATIONS_SQL.format(table=migrations_table))
+            self.keep("ch-migrations-recent", ok, rows=ch_rows(text, self.sb) if ok else None,
+                      error=None if ok else scrub_error_text(text, self.sb))
+
+    def postgres(self) -> None:
+        if not (self.host.container("postgres-ha") or self.host.container("postgres")):
+            self.keep("postgres", False, error="postgres is not running on this host")
+            return
+        for name, sql in PG_PROBE_QUERIES:
+            ok, text = self.host.pg_sql(sql)
+            self.keep(name, ok, rows=tsv_rows(text) if ok else None,
+                      error=None if ok else scrub_error_text(text, self.sb))
+
+    def system(self) -> None:
+        for name, cmd in (("disk-free", ["df", "-P", "-B1"]), ("inodes-free", ["df", "-P", "-i"])):
+            rc, out, err = run(cmd, timeout=30)
+            rows = []
+            for ln in out.splitlines()[1:]:
+                f = ln.split()
+                if len(f) >= 6:
+                    rows.append({"filesystem": f[0], "size": coerce(f[1]), "used": coerce(f[2]),
+                                 "available": coerce(f[3]), "use_pct": coerce(f[4].rstrip("%")),
+                                 "mounted_on": " ".join(f[5:])})
+            self.keep(name, rc == 0, rows=rows, error=None if rc == 0 else err[:300])
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                keep = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Committed_AS")
+                rows = [{"key": k.strip(), "kib": coerce(v.split()[0])}
+                        for k, v in (ln.split(":", 1) for ln in fh if ":" in ln) if k.strip() in keep]
+            self.keep("memory", True, rows=rows)
+        except OSError as err:
+            self.keep("memory", False, error=str(err))
+        # Kernel OOM-killer lines (names of killed processes only; dmesg may need root).
+        rc, out, err = run(["sh", "-c", "(journalctl -k --since '-%ds' --no-pager 2>/dev/null || dmesg 2>/dev/null) "
+                            "| grep -iE 'out of memory|oom-kill|killed process' | tail -n 50" % self.since_s],
+                           timeout=30)
+        self.keep("kernel-oom", True, text=out[-8000:] or "(none found, or not readable without root)")
+
+    def collect(self) -> dict:
+        for step in (self.containers, self.health, self.vector, self.vector_files, self.clickhouse, self.postgres,
+                     self.system):
+            try:
+                step()
+            except Exception as err:  # one failed probe never loses the rest
+                self.keep(f"error-{step.__name__}", False, error=f"{type(err).__name__}: {err}")
+        return {"tool": "support", "tool_version": TOOL_VERSION, "kind": "probes", "collected_utc": utc_now(),
+                "host": self.host.host_name, "since_seconds": self.since_s, "redactions": self.redact.count,
+                "contains_event_data": False, "probes": self.out}
+
+
+# Kubernetes Secret data keys whose values are NOT secret: seeding them would erase user names,
+# hosts and database names from every line. Everything else in a Secret is seeded.
+NON_SECRET_K8S_KEYS = frozenset({
+    "user", "username", "user_name", "login", "admin_user", "clickhouse_user", "postgres_user", "db_user",
+    "host", "hostname", "server", "address", "port", "database", "db", "dbname", "db_name", "postgres_db",
+    "schema", "bucket", "region", "namespace", "cluster", "sslmode", "ssl_mode", "email", "issuer",
+    "audience", "client_id", "tenant_id", "deployment_id", "kind", "type", "name", "version",
+})
+SEED_MIN_LEN = 8
+_LINE_KV = re.compile(r"^\s*[\"']?([A-Za-z0-9_.-]+)[\"']?\s*[:=]\s*(.+?)\s*,?$")
+_XML_TEXT = re.compile(r"<([A-Za-z0-9_.-]+)>([^<]+)</\1>")
+_PEM_MARK = re.compile(r"^-----(BEGIN|END) [A-Z0-9 ]+-----$")
+
+
+def _norm_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+
+
+def _non_secret_key(key: str) -> bool:
+    k = _norm_key(key)
+    return k in NON_SECRET_K8S_KEYS or k.rsplit("_", 1)[-1] in ("user", "username", "host", "port", "database")
+
+
+def _url_parts(v: str) -> list:
+    """A URL's password (raw and decoded); a URL without one (a webhook with a secret path) whole."""
+    try:
+        u = urllib.parse.urlsplit(v)
+    except ValueError:
+        return [v]
+    if u.scheme and u.netloc:
+        if u.password:
+            return [u.password, urllib.parse.unquote(u.password)]
+        return [v]
+    return [v]
+
+
+def secret_seed_values(key: str, value: str) -> list:
+    """Exact values to replace for one Secret entry: every value except under a known non-secret key;
+    URLs give their password; JSON (.dockerconfigjson) gives each string leaf, and `auth` also its
+    decoded password; multi-line values (PEM, config files) give each line or each line's value."""
+    out: list = []
+
+    def add(v: str) -> None:
+        v = (v or "").strip().strip("\"'")
+        if len(v) >= SEED_MIN_LEN and v not in out and not _PEM_MARK.match(v):
+            out.append(v)
+
+    def leaf(k: str, v: str) -> None:
+        if _non_secret_key(k):
+            return
+        v = v.strip()
+        if "://" in v:
+            for part in _url_parts(v):
+                add(part)
+            return
+        add(v)
+        if ";" in v and "=" in v:  # connection strings: Server=..;User Id=..;Password=..
+            for seg in v.split(";"):
+                kk, eq, vv = seg.partition("=")
+                if eq:
+                    leaf(kk, vv)
+        if _norm_key(k) == "auth":  # registry auth: base64("user:password")
+            with contextlib.suppress(ValueError, UnicodeDecodeError):
+                user, _, pw = base64.b64decode(v + "=" * (-len(v) % 4)).decode("utf-8").partition(":")
+                add(pw)
+
+    def walk(k: str, obj) -> None:
+        if isinstance(obj, dict):
+            for kk, vv in obj.items():
+                walk(str(kk), vv)
+        elif isinstance(obj, list):
+            for vv in obj:
+                walk(k, vv)
+        elif isinstance(obj, str):
+            leaf(k, obj)
+
+    v = value.strip()
+    if not v or _non_secret_key(key):
+        return out
+    if v[:1] in "{[":
+        with contextlib.suppress(ValueError):
+            walk(key, json.loads(v))
+            return out
+    if "\n" not in v:
+        leaf(key, v)
+        return out
+    for line in v.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";", "//")) or _PEM_MARK.match(line):
+            continue
+        for tag, text in _XML_TEXT.findall(line):
+            leaf(tag, text)
+        if _XML_TEXT.search(line):
+            continue
+        m = _LINE_KV.match(line)
+        if m and not line.startswith("<"):
+            leaf(m.group(1), m.group(2))
+        elif not line.startswith("<"):
+            leaf(key, line)  # a PEM body line, or a bare value
+    return out
+
+
+class KubeProber:
+    """Read-only probes on a Helm install through kubectl exec (no port-forwards, no writes)."""
+
+    def __init__(self, sb, args, redact):
+        self.sb = sb
+        self.args = args
+        self.redact = redact
+        self.out: dict = {}
+        base = ["kubectl"] + (["--context", args.context] if args.context else [])
+        self.kube = base
+        self.ns = base + ["-n", args.namespace]
+        self.pods: list = []
+
+    keep = Prober.keep
+
+    def load_secrets(self) -> None:
+        """Add the namespace's Secret values to the redactor (in memory only, never written), so a
+        password quoted in an error is replaced as it is on Compose. Needs `get secrets`; without
+        it the probes still run with pattern redaction only, and the bundle says so."""
+        rc, out, err = run(self.ns + ["get", "secrets", "-o", "json"], timeout=60)
+        if rc != 0:
+            # Names here avoid nano's secret-key words (secret, token, password...): its redactor
+            # would read a probe named after one as a key=value secret and rewrite the line.
+            self.keep("redaction-seed", False, error="could not read the namespace's Secrets (no "
+                      "permission?): probes use pattern redaction only")
+            return
+        added = 0
+        try:
+            items = json.loads(out).get("items", [])
+        except ValueError:
+            items = []
+        for item in items:
+            if item.get("type") in ("kubernetes.io/service-account-token", "helm.sh/release.v1"):
+                continue  # namespace service-account JWTs match nano's JWT pattern; Helm releases are values dumps
+            for key, b64 in (item.get("data") or {}).items():
+                try:
+                    value = base64.b64decode(b64).decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                for v in secret_seed_values(key, value):
+                    self.redact.add(v, "K8S_VALUE")  # replaced as [REDACTED:K8S_VALUE]
+                    added += 1
+        self.keep("redaction-seed", True, rows=[{"values_added": added}])
+
+    def exec_argv(self, pod: str, container: str, script: str, *args) -> list:
+        """kubectl exec ... -- sh -c SCRIPT $0 $1 ...: the first extra argument is $0."""
+        return self.ns + ["exec", pod, "-c", container, "--", "sh", "-c", script, *args]
+
+    def discover(self) -> None:
+        rc, out, err = run(self.ns + ["get", "pods", "-o", "json"], timeout=60)
+        rows = []
+        if rc == 0:
+            for item in json.loads(out).get("items", []):
+                meta, spec, status = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
+                for cs in status.get("containerStatuses", []) or []:
+                    last = (cs.get("lastState") or {}).get("terminated") or {}
+                    waiting = (cs.get("state") or {}).get("waiting") or {}
+                    rows.append({"pod": meta.get("name"), "container": cs.get("name"), "ready": cs.get("ready"),
+                                 "restarts": cs.get("restartCount", 0), "waiting_reason": waiting.get("reason"),
+                                 "last_exit_code": last.get("exitCode"), "last_reason": last.get("reason"),
+                                 "last_finished_at": last.get("finishedAt"), "phase": status.get("phase")})
+                self.pods.append({"name": meta.get("name"), "phase": status.get("phase"),
+                                  "containers": [(c.get("name"), c.get("image", "")) for c in spec.get("containers", [])]})
+        self.keep("containers", rc == 0, rows=rows, error=None if rc == 0 else err[:500])
+
+    def _exec(self, pod: str, container: str, script: str, *args, timeout: int = 90) -> tuple:
+        rc, out, err = run(self.exec_argv(pod, container, script, *args), timeout=timeout)
+        return rc == 0, out + (("\n[stderr] " + err) if err.strip() and rc != 0 else "")
+
+    def clickhouse(self) -> None:
+        ch = [p for p in self.pods if p["phase"] == "Running" and "keeper" not in p["name"]
+              and any("clickhouse-server" in img or c == "clickhouse" for c, img in p["containers"])]
+        for pod in ch[:3]:
+            cname = next((c for c, img in pod["containers"] if "clickhouse-server" in img or c == "clickhouse"),
+                         pod["containers"][0][0])
+            script = 'printf "%s\\n" "$CLICKHOUSE_ADMIN_PASSWORD" | sh -c "$0" sh "$1"'
+            for name, sql in ch_probe_queries(self.args.since):
+                if name == "ch-migrations":
+                    continue
+                # $0 = the client script, $1 = the SQL.
+                ok, text = self._exec(pod["name"], cname, script, self.sb.CH_CLIENT_SH, sql)
+                self.keep(f"{name}@{pod['name']}", ok, rows=ch_rows(text, self.sb) if ok else None,
+                          error=None if ok else scrub_error_text(text, self.sb))
+
+    def postgres(self) -> None:
+        pg = [p for p in self.pods if p["phase"] == "Running" and "postgres" in p["name"]
+              and any("postgres" in img for _c, img in p["containers"])]
+        if not pg:
+            self.keep("postgres", False, error="no in-cluster PostgreSQL pod (external database): skipped")
+            return
+        pod = pg[0]
+        cname = next((c for c, img in pod["containers"] if "postgres" in img), pod["containers"][0][0])
+        script = ('psql -X -q -P pager=off -F "$(printf "\\t")" -A -U "${POSTGRES_USER:-nanosiem}" '
+                  '-d "${POSTGRES_DB:-nanosiem}" -v ON_ERROR_STOP=1 -c "SET statement_timeout = \'30s\'" -c "$1"')
+        for name, sql in PG_PROBE_QUERIES:
+            ok, text = self._exec(pod["name"], cname, script, "sh", sql)  # $0 = "sh", $1 = the SQL
+            self.keep(name, ok, rows=tsv_rows(text) if ok else None,
+                      error=None if ok else scrub_error_text(text, self.sb))
+
+    def vector(self) -> None:
+        """Vector's image has no HTTP client. On Helm its pod has a curl sidecar (config-consumer)
+        that shares the network namespace; the metrics port also answers through the API server's
+        pod proxy. Either way, nothing runs inside the vector container."""
+        vec = [p for p in self.pods if p["phase"] == "Running" and any(c == "vector" for c, _ in p["containers"])]
+        for pod in vec[:2]:
+            helper = next((c for c, img in pod["containers"] if c != "vector" and
+                           (c == "config-consumer" or "curl" in img)), None)
+            if helper:
+                script = ("curl -fsS -m 5 -H 'Content-Type: application/json' -d "
+                          f"{shlex.quote(VECTOR_TOPOLOGY_GQL)} http://127.0.0.1:8686/graphql 2>&1")
+                ok, out = self._exec(pod["name"], helper, script, timeout=30)
+                try:
+                    rows = [{"component_id": e["node"].get("componentId"), "kind": e["node"].get("componentType"),
+                             "type": e["node"].get("__typename")}
+                            for e in json.loads(out)["data"]["components"]["edges"]]
+                    self.keep(f"vector-topology@{pod['name']}", True, rows=rows)
+                except (ValueError, KeyError, TypeError):
+                    self.keep(f"vector-topology@{pod['name']}", False, text=out[:4000],
+                              error="Vector API did not answer")
+            else:
+                self.keep(f"vector-topology@{pod['name']}", False,
+                          error="no container with an HTTP client in the Vector pod: topology skipped")
+            rc, out, err = run(self.kube + ["get", "--raw", f"/api/v1/namespaces/{self.args.namespace}/pods/"
+                                            f"{pod['name']}:9598/proxy/metrics"], timeout=30)
+            if rc == 0 and out.strip():
+                text = self.sb.filter_vector_metrics(out) if hasattr(self.sb, "filter_vector_metrics") else out
+                self.keep(f"vector-metrics@{pod['name']}", True, rows=parse_prometheus(text)[:5000])
+            else:
+                self.keep(f"vector-metrics@{pod['name']}", False, error=(err or out).strip()[:300])
+
+    def nodes(self) -> None:
+        rc, out, err = run(self.ns[:-2] + ["top", "nodes", "--no-headers"], timeout=60)
+        self.keep("node-usage", rc == 0, text=(out or err)[:8000])
+        rc, out, err = run(self.ns + ["top", "pods", "--containers", "--no-headers"], timeout=60)
+        self.keep("pod-usage", rc == 0, text=(out or err)[:20000])
+
+    def collect(self) -> dict:
+        for step in (self.load_secrets, self.discover, self.clickhouse, self.postgres, self.vector, self.nodes):
+            try:
+                step()
+            except Exception as err:
+                self.keep(f"error-{step.__name__}", False, error=f"{type(err).__name__}: {err}")
+        return {"tool": "support", "tool_version": TOOL_VERSION, "kind": "probes", "collected_utc": utc_now(),
+                "host": f"k8s:{self.args.namespace}", "since_seconds": self.args.since,
+                "redactions": self.redact.count, "contains_event_data": False, "probes": self.out}
+
+
+# ------------------------------------------------------------------------------------------------
+# collect
+# ------------------------------------------------------------------------------------------------
+
+NEVER_COLLECTED = """\
+  Never collected: your log events or raw logs, search or query results (and no query text:
+  ClickHouse query_log is summed by hour and error code only), lookup or IOC contents, secret
+  .env values, private keys, license files."""
+
+SAMPLE_RES = {
+    "IPv4 addresses": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "email addresses": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    "URLs": re.compile(r"\bhttps?://[^\s\"'<>]+"),
+}
+
+
+class BundleError(ValueError):
+    """An archive that is too big, too deep or malformed to read safely."""
+
+
+class _Budget:
+    def __init__(self):
+        self.bytes = 0
+        self.members = 0
+
+    def take(self, n: int) -> None:
+        self.bytes += n
+        self.members += 1
+        if self.bytes > MAX_TOTAL_BYTES:
+            raise BundleError(f"bundle holds more than {human(MAX_TOTAL_BYTES)} of text "
+                              "(set SUPPORT_MAX_BUNDLE_BYTES to raise the limit)")
+        if self.members > MAX_MEMBERS:
+            raise BundleError(f"bundle holds more than {MAX_MEMBERS} files")
+
+
+def safe_member_name(name: str) -> bool:
+    """Relative, no '..', no backslashes: archives are only read in memory, but names become labels
+    and must never point outside the bundle."""
+    return bool(name) and not name.startswith(("/", "\\")) and ".." not in re.split(r"[/\\]", name) \
+        and "\x00" not in name
+
+
+def archive_texts(path: str):
+    """Yield (member name, text) for every regular file in a .tar.gz, descending into nested archives
+    (at most MAX_NESTING deep). Links, devices and unsafe names are skipped; size limits apply."""
+    budget = _Budget()
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            yield from _tar_texts(tar, "", budget, 0)
+    except (tarfile.TarError, EOFError, OSError) as err:
+        raise BundleError(f"{path}: not a readable .tar.gz ({err})") from None
+
+
+def _read_capped(fh, limit: int) -> bytes:
+    data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise BundleError(f"a file in the bundle is larger than {human(limit)}")
+    return data
+
+
+def _tar_texts(tar, prefix: str, budget: "_Budget", depth: int):
+    for m in tar:
+        if not m.isfile() or not safe_member_name(m.name):
+            continue
+        if m.size > MAX_MEMBER_BYTES:
+            raise BundleError(f"{prefix}{m.name} is larger than {human(MAX_MEMBER_BYTES)}")
+        fh = tar.extractfile(m)
+        if fh is None:
+            continue
+        nested = m.name.endswith((".tar.gz", ".tgz"))
+        if nested:
+            if depth >= MAX_NESTING:
+                raise BundleError(f"archives nested more than {MAX_NESTING} deep")
+            data = _read_capped(fh, MAX_MEMBER_BYTES)
+            budget.take(len(data))
+            try:
+                inner = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+            except (tarfile.TarError, EOFError, OSError):
+                continue
+            with inner:
+                yield from _tar_texts(inner, f"{prefix}{m.name}!", budget, depth + 1)
+            continue
+        data = _read_capped(fh, MAX_MEMBER_BYTES)  # a gzip member can expand past its header size
+        budget.take(len(data))
+        yield prefix + m.name, data.decode("utf-8", "replace")
+
+
+def short_member(name: str) -> str:
+    """'bundle/X.tar.gz!X/hosts/h/env.txt' -> 'bundle: hosts/h/env.txt' (easier to read)."""
+    if "!" in name:
+        outer, inner = name.split("!", 1)
+        parts = inner.split("/", 1)
+        return f"{outer.split('/')[0]}: {parts[1] if len(parts) > 1 else inner}"
+    return name
+
+
+def secret_findings(path: str, sb) -> list:
+    """Lines nano's redactor would still change: a second pass should find nothing."""
+    findings = []
+    red = sb.Redactor()
+    for name, text in archive_texts(path):
+        if name.endswith(("/README.md", "/GETTING-HELP.md")):  # nano's own help text, written by the tool
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            # Compare text, not the counter: patterns also "match" values already redacted.
+            if red(line) != line:
+                findings.append((short_member(name), i))
+    return findings
+
+
+def preview(path: str, findings: list | None) -> None:
+    """Print what the archive holds. findings: lines a second redaction pass would change, or None
+    when no redactor was available to check."""
+    files = list(archive_texts(path))
+    total = sum(len(t.encode()) for _, t in files)
+    eprint(f"\nPreview of {os.path.basename(path)}: {len(files)} files, {human(total)} of text")
+    for name, text in sorted(files)[:80]:
+        eprint(f"  {human(len(text.encode())):>10}  {short_member(name)}")
+    if len(files) > 80:
+        eprint(f"  ... and {len(files) - 80} more")
+    blob = "\n".join(t for _, t in files)
+    eprint("\nThings in it you may want to check (logs can name your hosts, addresses and users):")
+    for label, rx in SAMPLE_RES.items():
+        found = sorted(set(rx.findall(blob)))
+        shown = ", ".join(found[:6]) + (" ..." if len(found) > 6 else "")
+        eprint(f"  {label}: {len(found)} distinct{(': ' + shown) if found else ''}")
+    leftovers = findings or []
+    if findings is None:
+        eprint("  secret-looking text left after redaction: not checked (no redactor)")
+    elif leftovers:
+        eprint(f"  secret-looking text a second redaction pass would still change: {len(leftovers)} lines, e.g. "
+               + ", ".join(f"{n}:{i}" for n, i in leftovers[:5]))
+    else:
+        eprint("  secret-looking text left after redaction: none found")
+    eprint(NEVER_COLLECTED)
+
+
+def wrap_archive(out_path: str, members: dict) -> None:
+    """members: {archive name: bytes}. Mode 0600, refuses to overwrite."""
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        now = int(time.time())
+        for name in sorted(members):
+            data = members[name]
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(data), now, 0o600
+            tar.addfile(info, io.BytesIO(data))
+
+
+def copy_private(src: str, dest: str) -> None:
+    """Copy to a NEW file created 0600 in one step (O_EXCL: never overwrites, never follows a
+    symlink at dest), removing a partial file on error."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(dest, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(dest)
+        raise
+
+
+def _last_written(text: str) -> str | None:
+    m = re.findall(r"^Wrote (\S+\.tar\.gz) \(", text, re.M)
+    return m[-1] if m else None
+
+
+def cmd_collect(args) -> int:
+    since = args.since
+    work = tempfile.mkdtemp(prefix="nano-support-")
+    os.chmod(work, 0o700)
+    try:
+        if args.kubernetes:
+            return _collect_kubernetes(args, work)
+        if args.ssh:
+            return _collect_ssh(args, work)
+        return _collect_local(args, work, since)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def build_support_archive(work: str, bundle_path: str | None, probes: dict | None, label: str,
+                          extra: dict | None = None) -> str | None:
+    """The wrapper archive (draft, 0600) in work: bundle/<nano archive>, probes/probes.json, manifest."""
+    members: dict = {}
+    if bundle_path:
+        with open(bundle_path, "rb") as fh:
+            members[f"bundle/{os.path.basename(bundle_path)}"] = fh.read()
+    if probes is not None:
+        members["probes/probes.json"] = (json.dumps(probes, indent=1, default=str) + "\n").encode()
+    if not members:
+        return None
+    manifest = {"tool": "support", "tool_version": TOOL_VERSION, "created_utc": utc_now(),
+                "contains_event_data": False, "members": sorted(members),
+                "nano_bundle": os.path.basename(bundle_path) if bundle_path else None,
+                "probes": sorted((probes or {}).get("probes", {})), **(extra or {})}
+    members["SUPPORT-MANIFEST.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "-", label)[:40] or "nano"
+    draft = os.path.join(work, f"support-{safe_label}-{stamp}.tar.gz")
+    wrap_archive(draft, members)
+    return draft
+
+
+def _finish_collect(args, draft: str | None, findings: list | None) -> int:
+    """Preview the draft, ask, then write it as a new 0600 file. Nothing is written on 'no'."""
+    if not draft:
+        eprint("Nothing was collected.")
+        return 1
+    preview(draft, findings)
+    out_dir = os.path.abspath(os.path.expanduser(args.out_dir or "."))
+    final = os.path.join(out_dir, os.path.basename(draft))
+    if os.path.lexists(final):
+        eprint(f"{final} already exists: not overwriting it. Pick another --out-dir.")
+        return 1
+    if not ask(f"\nWrite {final} (mode 0600)?", args.yes):
+        eprint("Nothing written. The draft was deleted.")
+        return 1
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    try:
+        copy_private(draft, final)
+    except FileExistsError:
+        eprint(f"{final} appeared while you were answering: not overwriting it.")
+        return 1
+    print(f"Wrote {final} ({human(os.path.getsize(final))}, mode 0600).")
+    print("Nothing was sent anywhere. Review it, then load it locally (support load FILE) or attach it to a")
+    print("support case: https://nano.rs/docs/support/")
+    return 0
+
+
+def tool_identity(tool: str) -> str:
+    digest = file_sha256(tool)
+    rel = known_release_of(digest)
+    return (f"sha256 {digest[:16]}..., matches nano {rel[0]}" + (f"-{rel[-1]}" if len(rel) > 1 else "")
+            if rel else f"sha256 {digest[:16]}..., not a published release (modified or newer than this tool)")
+
+
+def run_local_collection(sb, tool: str, install_dir: str, since: int, local_only: bool, no_probes: bool,
+                         work: str) -> tuple:
+    """nano's bundle tool + probes on THIS host. (draft path or None, findings)."""
+    bundle_out = os.path.join(work, "bundle")
+    os.makedirs(bundle_out, mode=0o700)
+    cmd = [sys.executable or "python3", "-I", tool, "--install-dir", install_dir, "--since", f"{since}s",
+           "--out-dir", bundle_out] + (["--local-only"] if local_only else [])
+    eprint("\nRunning nano support-bundle ...")
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+    bundle_path = _last_written(p.stdout or "")
+    if p.returncode != 0 or not bundle_path:
+        eprint(f"nano support-bundle failed (exit {p.returncode}). Its output is above.")
+        return None, None
+    probes = None
+    if not no_probes:
+        eprint("Running live probes ...")
+        red = sb.Redactor()
+        red.add_env(sb.read_env(os.path.join(install_dir, ".env")))
+        red.add_env(sb.read_env(os.path.join(install_dir, ".nano-role.env")))
+        probes = Prober(sb, install_dir, since, red).collect()
+    label = os.path.basename(bundle_path).replace("nano-support-", "").rsplit("-", 1)[0]
+    draft = build_support_archive(work, bundle_path, probes, label,
+                                  {"nano_bundle_tool": tool_identity(tool)})
+    return draft, (secret_findings(draft, sb) if draft else None)
+
+
+def _collect_local(args, work: str, since: int) -> int:
+    install_dir = os.path.abspath(os.path.expanduser(args.install_dir or "~/nano"))
+    tool = find_install_tool(install_dir)
+    if not tool:
+        eprint(f"No nano support bundle tool in {install_dir}/scripts (nano 2.0.25 and later ship it).")
+        eprint("Run this on the nano host itself, point --install-dir at the install, or use --ssh USER@HOST.")
+        eprint("Older releases: use the copy in the nano-deploy agent skill (skills/nano-deploy/scripts/"
+               "support-bundle.py in github.com/nano-rs/nano).")
+        return 2
+    version = install_version(install_dir) or "unknown"
+    eprint(f"support collect: install {install_dir} (nano {version}), last {since // 3600}h"
+           f"{'' if since % 3600 == 0 else f' {since % 3600 // 60}m'}")
+    eprint(f"  1. nano's own bundle tool: {tool} ({tool_identity(tool)})")
+    eprint("  2. " + ("live probes: health, migrations, Vector, ClickHouse, PostgreSQL, disk, memory"
+                     if not args.no_probes else "live probes: skipped (--no-probes)"))
+    eprint(NEVER_COLLECTED)
+    if not ask("Collect now? Everything stays in a private temporary folder until you approve the preview.",
+               args.yes):
+        return 1
+    sb = load_bundle_module(tool)  # this install's own tool, on this install's host
+    draft, findings = run_local_collection(sb, tool, install_dir, since, args.local_only, args.no_probes, work)
+    if draft is None:
+        return 1
+    return _finish_collect(args, draft, findings)
+
+
+def ssh_base(args) -> list:
+    if not args.ssh or not SAFE_SSH.fullmatch(args.ssh):
+        die("--ssh must look like user@host (letters, digits, '.', '_', '-'; neither part may start with '-')")
+    # BatchMode first (never overridable); the user's options next, then defaults: ssh keeps the
+    # FIRST value it sees for an option.
+    ssh = ["ssh", "-o", "BatchMode=yes"]
+    user_opts: list = []
+    if args.ssh_port:
+        if not 1 <= args.ssh_port <= 65535:
+            die("--ssh-port must be 1-65535")
+        ssh += ["-p", str(args.ssh_port)]
+    if args.ssh_identity:
+        ssh += ["-i", os.path.expanduser(args.ssh_identity)]
+    for opt in args.ssh_option or []:
+        m = re.fullmatch(r"([A-Za-z]+)=([A-Za-z0-9_./~:@,+-]+)", opt or "")
+        if not m or m.group(1) not in SSH_OPTION_ALLOW:
+            die(f"--ssh-option {opt!r}: allowed are Name=value with Name one of {', '.join(sorted(SSH_OPTION_ALLOW))}")
+        user_opts += ["-o", opt]
+    ssh += user_opts + ["-o", "ConnectTimeout=10"]
+    return ssh + ["--", args.ssh]  # "--": the destination can never be read as an option
+
+
+REMOTE_FINDINGS_MARK = "SUPPORT-REMOTE-RESULT "
+
+
+def _collect_ssh(args, work: str) -> int:
+    """Collect on the host over ssh. Nothing from the host is ever run here: this script is streamed
+    TO the host, runs nano's tool and the probes THERE (redaction and the second pass happen on the
+    host), and only the finished archive and a small JSON summary come back."""
+    ssh = ssh_base(args)
+    remote_dir = args.install_dir or "~/nano"
+    if "\x00" in remote_dir or "\n" in remote_dir:
+        die("--install-dir has unsupported characters")
+    eprint(f"support collect: {args.ssh}, install {remote_dir}, last {args.since // 3600}h")
+    eprint(f"  1. nano's own bundle tool on the host: {remote_dir}/scripts/nano-support-bundle")
+    eprint("  2. " + ("live probes on the host" if not args.no_probes else "live probes: skipped"))
+    eprint("  This script is streamed to the host and runs there with python3; redaction happens on the host.")
+    eprint("  Nothing from the host runs on this machine. A temporary folder on the host is removed afterwards.")
+    eprint(NEVER_COLLECTED)
+    if not ask("Collect now?", args.yes):
+        return 1
+    with open(os.path.abspath(__file__), "rb") as fh:
+        me = fh.read()
+    remote = ["python3", "-I", "-", "_remote-collect", "--install-dir", remote_dir, "--since", f"{args.since}s"]
+    remote += (["--local-only"] if args.local_only else []) + (["--no-probes"] if args.no_probes else [])
+    draft = os.path.join(work, "remote-draft.tar.gz")
+    eprint("\nCollecting on the host ...")
+    fd = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            p = subprocess.run(ssh + [shlex.join(remote)], input=me, stdout=out, stderr=subprocess.PIPE,
+                               timeout=1800)
+    except subprocess.TimeoutExpired:
+        eprint("Collection on the host timed out after 30 minutes (its temporary folder is removed when it exits).")
+        return 1
+    err = p.stderr.decode("utf-8", "replace")
+    result = None
+    for line in err.splitlines():
+        if line.startswith(REMOTE_FINDINGS_MARK):
+            with contextlib.suppress(ValueError):
+                result = json.loads(line[len(REMOTE_FINDINGS_MARK):])
+        else:
+            eprint(line)
+    if p.returncode != 0 or not isinstance(result, dict) or not result.get("ok"):
+        eprint(f"Collection failed on the host (exit {p.returncode}). "
+               + (result.get("error", "") if isinstance(result, dict) else "No result from the host."))
+        return 2 if isinstance(result, dict) and result.get("missing_tool") else 1
+    try:
+        names = [n for n, _ in archive_texts(draft)]
+    except BundleError as e:
+        eprint(f"The archive from the host is not usable: {e}")
+        return 1
+    if not names:
+        eprint("The archive from the host is empty.")
+        return 1
+    final_name = result.get("name") if re.fullmatch(r"support-[A-Za-z0-9._-]+\.tar\.gz", str(result.get("name"))) \
+        else "support-remote.tar.gz"
+    named = os.path.join(work, final_name)
+    os.rename(draft, named)
+    eprint(f"  nano's bundle tool on the host: {result.get('tool_identity', 'unknown')}")
+    findings = [tuple(x) for x in result.get("findings", []) if isinstance(x, list) and len(x) == 2]
+    return _finish_collect(args, named, findings)
+
+
+def cmd_remote_collect(args) -> int:
+    """Hidden, runs ON the nano host (streamed over ssh): collect into a private temporary folder,
+    write the archive to stdout, a one-line JSON result to stderr. The folder is always removed."""
+    import signal
+
+    def bail(signum, _frame):
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, bail)
+
+    def result(**kw):
+        sys.stderr.write(REMOTE_FINDINGS_MARK + json.dumps(kw) + "\n")
+        sys.stderr.flush()
+    install_dir = os.path.abspath(os.path.expanduser(args.install_dir or "~/nano"))
+    tool = find_install_tool(install_dir)
+    if not tool:
+        result(ok=False, missing_tool=True, error=f"no scripts/{BUNDLE_TOOL_NAME} in {install_dir} "
+               "(check --install-dir; nano 2.0.25 and later ship it)")
+        return 2
+    sb = load_bundle_module(tool)
+    with tempfile.TemporaryDirectory(prefix="nano-support-") as work:
+        os.chmod(work, 0o700)
+        # nano's tool prints its progress on stdout: keep our stdout for the archive only.
+        saved = os.dup(1)
+        os.dup2(2, 1)
+        try:
+            draft, findings = run_local_collection(sb, tool, install_dir, args.since, args.local_only,
+                                                   args.no_probes, work)
+        finally:
+            sys.stdout.flush()
+            os.dup2(saved, 1)
+            os.close(saved)
+        if not draft:
+            result(ok=False, error="nano support-bundle failed on the host (its output is above)")
+            return 1
+        with open(draft, "rb") as fh:
+            shutil.copyfileobj(fh, sys.stdout.buffer)
+        sys.stdout.buffer.flush()
+        result(ok=True, name=os.path.basename(draft), findings=findings or [], tool_identity=tool_identity(tool))
+    return 0
+
+
+def _collect_kubernetes(args, work: str) -> int:
+    for name in (args.namespace, args.release):
+        if not SAFE_NAME.fullmatch(name):
+            die("invalid --namespace or --release")
+    tool = args.bundle_tool
+    if tool and not os.path.isfile(tool):
+        die(f"--bundle-tool {tool} does not exist")
+    if not tool:
+        for cand in ("nano/scripts/nano-support-bundle", "scripts/nano-support-bundle"):
+            if os.path.isfile(cand):
+                tool = cand
+                break
+    if not tool:
+        helm = ["helm"] + (["--kube-context", args.context] if args.context else []) + ["-n", args.namespace]
+        rc, out, _ = run(helm + ["list", "-o", "json", "--filter", f"^{re.escape(args.release)}$"], timeout=60)
+        version = ""
+        with contextlib.suppress(ValueError, IndexError, KeyError, TypeError):
+            version = str(json.loads(out)[0]["app_version"]).lstrip("v")
+        eprint("No nano support bundle tool found (looked for nano/scripts/nano-support-bundle from the pulled chart).")
+        if version not in KNOWN_BUNDLE_TOOL_SHA256:
+            eprint(f"Release {args.release} runs nano {version or 'of an unknown version'}, which has no pinned "
+                   "SHA-256 here. Pull the chart for your release (helm pull --untar) and pass --bundle-tool "
+                   "nano/scripts/nano-support-bundle, or run:")
+            eprint(f"  python3 nano/scripts/nano-support-bundle --kubernetes --namespace {args.namespace} "
+                   f"--release {args.release}")
+            return 2
+        url = NANO_RAW_URL.format(version=version)
+        eprint(f"Release {args.release} runs nano {version}. The matching tool is published at\n  {url}\n"
+               f"  and must have SHA-256 {KNOWN_BUNDLE_TOOL_SHA256[version]} (checked before it is saved or run).")
+        if not ask("Download it from the public nano repository?", args.yes):
+            eprint("Or run it yourself from the pulled chart:\n"
+                   f"  python3 nano/scripts/nano-support-bundle --kubernetes --namespace {args.namespace}")
+            return 1
+        try:
+            tool, digest = download_bundle_tool(version, work)
+        except (OSError, ValueError, urllib.error.URLError) as err:
+            eprint(f"Download refused or failed: {err}")
+            return 1
+        eprint(f"  verified sha256 {digest}")
+    eprint(f"support collect: Kubernetes namespace {args.namespace}, release {args.release}")
+    eprint(f"  1. nano's own bundle tool: {tool} --kubernetes ({tool_identity(tool)})")
+    eprint("  2. " + ("live probes through kubectl exec (read-only); the namespace's Secret values are read "
+                     "into memory to redact them" if not args.no_probes else "probes skipped"))
+    eprint(NEVER_COLLECTED)
+    if not ask("Collect now?", args.yes):
+        return 1
+    sb = load_bundle_module(tool)
+    bundle_out = os.path.join(work, "bundle")
+    os.makedirs(bundle_out, mode=0o700)
+    cmd = [sys.executable or "python3", "-I", tool, "--kubernetes", "--namespace", args.namespace,
+           "--release", args.release, "--since", f"{args.since}s", "--out-dir", bundle_out]
+    if args.context:
+        cmd += ["--context", args.context]
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+    bundle_path = _last_written(p.stdout or "")
+    if p.returncode != 0 or not bundle_path:
+        eprint(f"nano support-bundle failed (exit {p.returncode}).")
+        return 1
+    probes = None if args.no_probes else KubeProber(sb, args, sb.Redactor()).collect()
+    draft = build_support_archive(work, bundle_path, probes, args.namespace,
+                                  {"nano_bundle_tool": tool_identity(tool)})
+    return _finish_collect(args, draft, secret_findings(draft, sb) if draft else None)
+
+
+def cmd_probe_internal(args) -> int:
+    """Hidden: run probes on THIS host and print redacted JSON."""
+    install_dir = os.path.abspath(os.path.expanduser(args.install_dir or "~/nano"))
+    tool = find_install_tool(install_dir)
+    if not tool:
+        eprint(f"no {BUNDLE_TOOL_NAME} in {install_dir}/scripts")
+        return 2
+    sb = load_bundle_module(tool)
+    red = sb.Redactor()
+    red.add_env(sb.read_env(os.path.join(install_dir, ".env")))
+    red.add_env(sb.read_env(os.path.join(install_dir, ".nano-role.env")))
+    print(json.dumps(Prober(sb, install_dir, args.since, red).collect(), default=str))
+    return 0
+
+
+def cmd_check(args) -> int:
+    tool = args.bundle_tool or os.environ.get("SUPPORT_BUNDLE_TOOL")
+    if not tool or not os.path.isfile(tool):
+        die("check needs nano's redactor: pass --bundle-tool PATH (scripts/nano-support-bundle from your install)")
+    sb = load_bundle_module(tool)
+    rc = 0
+    for path in args.bundles:
+        try:
+            found = secret_findings(path, sb)
+        except BundleError as err:
+            print(f"{path}: {err}")
+            rc = 2
+            continue
+        if found:
+            rc = 1
+            print(f"{path}: {len(found)} lines still look secret:")
+            for name, line in found[:50]:
+                print(f"  {name}:{line}")
+        else:
+            print(f"{path}: no secret-looking text found")
+    return rc
+
+
+# ------------------------------------------------------------------------------------------------
+# Bundle parsing (pure functions: tested without Docker)
+# ------------------------------------------------------------------------------------------------
+
+TS_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\s?(.*)$")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# tracing's plain format: `<ts> LEVEL span{k=v}:span2{..}: target: message key=value ...`
+RUST_TEXT = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\S+)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+"
+                       r"(?P<spans>(?:[A-Za-z0-9_]+\{[^}]*\}:?)+\s)?"
+                       r"(?P<target>[A-Za-z0-9_:.-]+):\s(?P<msg>.*)$")
+CH_TEXT = re.compile(r"^(?P<ts>\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+\[\s*\d+\s*\]\s+"
+                     r"(?:\{[^}]*\}\s+)?<(?P<level>\w+)>\s+(?P<target>[^:]+?):\s(?P<msg>.*)$")
+PG_TEXT = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)(?: (?P<tz>[A-Z]{2,5}))?\s+"
+                     r"\[\d+\]\s+(?:\S+@\S+\s+)?(?P<level>LOG|ERROR|FATAL|PANIC|WARNING|NOTICE|DETAIL|HINT|"
+                     r"STATEMENT|INFO|DEBUG\d?):\s+(?P<msg>.*)$")
+NGINX_ACCESS = re.compile(r'^\S+ \S+ \S+ \[[^\]]+\] "(?P<req>[^"]*)" (?P<status>\d{3}) ')
+NGINX_ERROR = re.compile(r"^(?P<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<msg>.*)$")
+LEAD_LEVEL = re.compile(r"(?i)^(error|warning|warn|fatal|panic)(?:\[[A-Z]?\d+\])?:")  # VRL diagnostics, scripts
+VALKEY_TEXT = re.compile(r"^\d+:[MSCX] \d{2} \w{3} \d{4} [\d:.]+ ([#*.-]) ")
+LEVEL_WORD = re.compile(r"\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC|CRITICAL)\b")
+LEVEL_MAP = {"warning": "WARN", "warn": "WARN", "err": "ERROR", "error": "ERROR", "fatal": "FATAL",
+             "panic": "FATAL", "critical": "FATAL", "crit": "FATAL", "information": "INFO", "info": "INFO",
+             "notice": "INFO", "log": "INFO", "debug": "DEBUG", "trace": "TRACE", "emerg": "FATAL",
+             "alert": "FATAL", "detail": "INFO", "hint": "INFO", "statement": "INFO"}
+
+
+def norm_level(level: str | None) -> str:
+    if not level:
+        return ""
+    low = level.strip().lower()
+    if low.startswith("debug"):
+        return "DEBUG"
+    return LEVEL_MAP.get(low, level.strip().upper())
+
+
+def to_iso(ts: str | None) -> str | None:
+    """Any of the timestamp shapes we see into 'YYYY-MM-DD HH:MM:SS.ffffff' (UTC)."""
+    if not ts:
+        return None
+    t = ts.strip().replace("T", " ")
+    t = re.sub(r"^(\d{4})[./](\d{2})[./](\d{2})", r"\1-\2-\3", t)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d+))?\s*(Z|UTC|[+-]\d{2}:?\d{2})?$", t)
+    if not m:
+        return None
+    base, frac, tz = m.group(1), (m.group(2) or "0")[:6].ljust(6, "0"), m.group(3)
+    try:
+        dt = _dt.datetime.strptime(f"{base}.{frac}", "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return None
+    if tz and tz not in ("Z", "UTC"):
+        sign = 1 if tz[0] == "+" else -1
+        hh, mm = int(tz[1:3]), int(tz[-2:])
+        dt = dt - sign * _dt.timedelta(hours=hh, minutes=mm)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def parse_log_line(line: str) -> dict:
+    """One log line into {ts, level, target, message, fields}. Never raises."""
+    line = ANSI.sub("", line.rstrip("\r\n"))
+    out = {"ts": None, "level": "", "target": "", "message": line, "fields": {}}
+    m = TS_PREFIX.match(line)
+    body = line
+    if m:  # docker / kubectl --timestamps prefix
+        out["ts"] = to_iso(m.group(1))
+        body = m.group(2)
+    out["message"] = body
+    stripped = body.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            fields = obj.get("fields") if isinstance(obj.get("fields"), dict) else {}
+            fields = dict(fields)
+            msg = fields.pop("message", None) or obj.get("message") or obj.get("msg") or ""
+            for k, v in obj.items():
+                if k not in ("timestamp", "time", "ts", "level", "severity", "target", "fields", "message", "msg"):
+                    fields[k] = v
+            meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            target = obj.get("target") or obj.get("logger") or meta.get("target") or meta.get("module_path") or ""
+            if not target and obj.get("source_type") == "internal_logs":
+                target = "vector::internal_logs"  # Vector's own log events; nano's bundle scrubs their metadata
+            out.update(level=norm_level(str(obj.get("level") or obj.get("severity") or meta.get("level") or "")),
+                       target=str(target), message=str(msg), fields=fields)
+            jts = to_iso(str(obj.get("timestamp") or obj.get("time") or obj.get("ts") or "")) \
+                if isinstance(obj.get("timestamp") or obj.get("time") or obj.get("ts"), str) else None
+            out["ts"] = jts or out["ts"]
+            return out
+    for rx in (RUST_TEXT, CH_TEXT, PG_TEXT, NGINX_ERROR):
+        mm = rx.match(stripped)
+        if mm:
+            gd = mm.groupdict()
+            out["level"] = norm_level(gd.get("level"))
+            out["target"] = (gd.get("target") or "").strip()
+            out["message"] = gd.get("msg", stripped)
+            out["ts"] = out["ts"] or to_iso(gd.get("ts"))
+            if rx is CH_TEXT:
+                code = re.search(r"Code: (\d+)", out["message"])
+                if code:
+                    out["fields"]["code"] = int(code.group(1))
+            return out
+    mm = NGINX_ACCESS.match(stripped)
+    if mm:
+        status = int(mm.group("status"))
+        out["level"] = "ERROR" if status >= 500 else "WARN" if status >= 400 else "INFO"
+        out["target"] = "access"
+        out["fields"] = {"status": status, "request": mm.group("req")}
+        return out
+    lead = LEAD_LEVEL.match(stripped)
+    if lead:
+        out["level"] = norm_level(lead.group(1))
+        return out
+    vk = VALKEY_TEXT.match(stripped)
+    if vk:
+        out["level"] = {"#": "WARN", "*": "INFO", "-": "INFO", ".": "DEBUG"}[vk.group(1)]
+        out["target"] = "valkey"
+        return out
+    word = LEVEL_WORD.search(stripped[:120])
+    if word:
+        out["level"] = norm_level(word.group(1))
+    elif re.search(r"(?i)\b(exception|traceback|failed|refused|denied)\b", stripped):
+        out["level"] = "ERROR"
+    code = re.search(r"Code: (\d+)", stripped)
+    if code:
+        out["fields"]["code"] = int(code.group(1))
+    return out
+
+
+SERVICE_HINTS = [("nano-api", "api"), ("nanosiem-api", "api"), ("search", "search"), ("jobs", "jobs"),
+                 ("vector-config-consumer", "vector-config-consumer"), ("vector", "vector"),
+                 ("clickhouse-proxy", "clickhouse-proxy"), ("clickhouse", "clickhouse"), ("keeper", "keeper"),
+                 ("postgres", "postgres"), ("patroni", "postgres"), ("valkey", "valkey"), ("dragonfly", "valkey"),
+                 ("migrate", "migrate"), ("web", "web"), ("nginx", "web"), ("tenzir", "tenzir"),
+                 ("connector", "connector-runner")]
+
+
+def guess_service(name: str) -> str:
+    n = name.lower()
+    for hint, svc in SERVICE_HINTS:
+        if hint in n:
+            return svc
+    return re.sub(r"-\d+$", "", n)
+
+
+def sections(text: str) -> list:
+    """'## title' sections of nano's bundle text files: [(title, body)]."""
+    out, title, buf = [], None, []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if title is not None:
+                out.append((title, "\n".join(buf).strip("\n")))
+            title, buf = line[3:].strip(), []
+        else:
+            buf.append(line)
+    if title is not None:
+        out.append((title, "\n".join(buf).strip("\n")))
+    elif text.strip():
+        out.append(("", text.strip("\n")))
+    return out
+
+
+def table_rows(body: str) -> list | None:
+    """Rows when a section body is a tab-separated table with a header, else None."""
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not re.fullmatch(r"\(\d+ rows?\)", ln.strip())]
+    if len(lines) < 2 or "\t" not in lines[0]:
+        return None
+    width = lines[0].count("\t")
+    if sum(1 for ln in lines[1:] if ln.count("\t") == width) < max(1, (len(lines) - 1) // 2):
+        return None
+    return tsv_rows("\n".join(lines))
+
+
+CONTAINER_LINE = re.compile(r"service=(?P<service>\S*) restarts=(?P<restarts>\d+) oom=(?P<oom>\w+) "
+                            r"exit=(?P<exit>-?\d+) started=(?P<started>\S+) finished=(?P<finished>\S+)"
+                            r" error=(?P<error>.*)$")
+
+
+def parse_containers(text: str) -> list:
+    rows = []
+    for title, body in sections(text):
+        m = CONTAINER_LINE.search(body.splitlines()[0] if body else "")
+        if not m:
+            continue
+        row = {"container": title, "service": m.group("service"), "restarts": int(m.group("restarts")),
+               "oom_killed": m.group("oom") == "true", "exit_code": int(m.group("exit")),
+               "started_at": m.group("started"), "finished_at": m.group("finished"),
+               "error": m.group("error").strip()}
+        h = re.search(r"health=(\S*)(?: failing_streak=(\d+))?", body)
+        if h:
+            row["health"] = h.group(1)
+            row["failing_streak"] = int(h.group(2)) if h.group(2) else None
+        mem = re.search(r"mem_limit=(\d+)", body)
+        if mem:
+            row["mem_limit_bytes"] = int(mem.group(1))
+        rows.append(row)
+    return rows
+
+
+PROM_LINE = re.compile(r"^(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)")
+
+
+def parse_prometheus(text: str) -> list:
+    rows = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        m = PROM_LINE.match(line.strip())
+        if not m:
+            continue
+        labels = dict(re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', m.group("labels") or ""))
+        try:
+            value = float(m.group("value"))
+        except ValueError:
+            continue
+        rows.append({"metric": m.group("metric"), "labels": labels, "value": value})
+    return rows
+
+
+AGE_RE = re.compile(r"(\d+)([smhd])")
+
+
+def parse_age(text: str) -> float | None:
+    if text in ("<unknown>", "", "<invalid>"):
+        return None
+    parts = AGE_RE.findall(text)
+    if not parts:
+        return None
+    return sum(int(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u] for n, u in parts)
+
+
+FIXED_HEADER = re.compile(r"^[A-Z][A-Z0-9_()%-]*(?: [A-Z][A-Z0-9_()%-]*)*(?:\s{2,}[A-Z][A-Z0-9_()%-]*(?: [A-Z][A-Z0-9_()%-]*)*)+\s*$")
+
+
+def parse_fixed_table(text: str) -> list | None:
+    """Column-aligned CLI tables (docker compose ps, kubectl get ...) into dicts, else None."""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2 or not FIXED_HEADER.match(lines[0]):
+        return None
+    header = lines[0]
+    cols = [(m.group(0).strip(), m.start()) for m in re.finditer(r"\S+(?: \S+)*", header)]
+    rows = []
+    for ln in lines[1:]:
+        rec = {}
+        for i, (name, start) in enumerate(cols):
+            end = cols[i + 1][1] if i + 1 < len(cols) else len(ln)
+            # Values can be longer than their header (an image name): extend to the next column's
+            # start only when that position is a space boundary, else to the next run of spaces.
+            if i + 1 < len(cols) and end < len(ln) and ln[end - 1:end] != " ":
+                m = re.search(r"\s{2,}", ln[start:])
+                end = start + m.start() if m else len(ln)
+            rec[name] = ln[start:end].strip() if i + 1 < len(cols) else ln[start:].strip()
+        rows.append(rec)
+    return rows
+
+
+def parse_k8s_events(text: str, collected: _dt.datetime | None) -> list:
+    """kubectl get events (table) into rows. LAST SEEN ages become timestamps."""
+    rows = []
+    for rec in parse_fixed_table(text) or []:
+        age = parse_age(rec.get("LAST SEEN", ""))
+        ts = None
+        if age is not None and collected is not None:
+            ts = (collected - _dt.timedelta(seconds=age)).strftime("%Y-%m-%d %H:%M:%S.%f")
+        rows.append({"ts": ts, "type": rec.get("TYPE", ""), "reason": rec.get("REASON", ""),
+                     "object": rec.get("OBJECT", ""), "message": rec.get("MESSAGE", ""),
+                     "raw": "  ".join(v for v in rec.values() if v)})
+    return rows
+
+
+def kv_lines(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s?(.*)$", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+class Bundle:
+    """A parsed bundle: rows for each table. Accepts nano's .tar.gz, support's wrapper or a directory."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.logs: list = []
+        self.k8s_events: list = []
+        self.facts: list = []
+        self.probes: list = []
+        self.collected: _dt.datetime | None = None
+        self.notes: list = []
+
+    # -- input --
+    @classmethod
+    def from_path(cls, path: str) -> "Bundle":
+        b = cls(os.path.basename(path.rstrip("/")))
+        files: dict = {}
+        if os.path.isdir(path):
+            # An unpacked bundle is untrusted: never follow a symlink out of it (a planted
+            # logs/x.log -> ~/.ssh/id_rsa would load that file), and keep the size limits.
+            root_real = os.path.realpath(path)
+            budget = _Budget()
+            for root, dirs, names in os.walk(path, followlinks=False):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                for n in names:
+                    full = os.path.join(root, n)
+                    rel = os.path.relpath(full, path)
+                    real = os.path.realpath(full)
+                    if os.path.islink(full) or os.path.commonpath([root_real, real]) != root_real \
+                            or not os.path.isfile(full):
+                        b.notes.append(f"{rel}: skipped (a link, or outside the bundle folder)")
+                        continue
+                    if n.endswith((".tar.gz", ".tgz")):
+                        for name, text in archive_texts(full):
+                            budget.take(len(text))
+                            files[f"{rel}!{name}"] = text
+                    else:
+                        fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        with os.fdopen(fd, "rb") as fh:
+                            data = _read_capped(fh, MAX_MEMBER_BYTES)
+                        budget.take(len(data))
+                        files[rel] = data.decode("utf-8", "replace")
+        else:
+            for name, text in archive_texts(path):
+                files[name] = text
+        b.ingest(files)
+        return b
+
+    def ingest(self, files: dict) -> None:
+        # Normalize: strip the archive prefix up to and including the nano-support-* top folder.
+        norm = {}
+        for name, text in files.items():
+            inner = name.split("!")[-1]
+            parts = inner.split("/")
+            if parts and parts[0].startswith(("nano-support-", "nano-support")) and len(parts) > 1:
+                parts = parts[1:]
+            norm["/".join(parts)] = text
+        manifest = norm.get("MANIFEST.json")
+        if manifest:
+            with contextlib.suppress(ValueError):
+                m = json.loads(manifest)
+                for k, v in m.items():
+                    if isinstance(v, (str, int, float, bool)) or v is None:
+                        self.fact("", f"manifest.{k}", v)
+                for h in m.get("hosts") or []:
+                    if isinstance(h, dict):
+                        self.fact(h.get("name", ""), "host.reached", h.get("ok"))
+                        if h.get("error"):
+                            self.fact(h.get("name", ""), "host.error", h.get("error"))
+                for note in m.get("notes") or []:
+                    self.fact("", "manifest.note", note)
+                with contextlib.suppress(ValueError, TypeError):
+                    self.collected = _dt.datetime.strptime(m.get("created_utc", ""), "%Y-%m-%dT%H:%M:%SZ")
+        for name in sorted(norm):
+            text = norm[name]
+            try:
+                self.ingest_file(name, text)
+            except Exception as err:  # a bad file never stops the load
+                self.notes.append(f"{name}: {type(err).__name__}: {err}")
+
+    def fact(self, host: str, key: str, value) -> None:
+        self.facts.append({"host": host or "", "key": key, "value": "" if value is None else str(value)})
+
+    def probe(self, host: str, source: str, name: str, value, ok: bool = True, text: str = "") -> None:
+        self.probes.append({"host": host or "", "source": source, "name": name, "ok": 1 if ok else 0,
+                            "row": len([p for p in self.probes if p["name"] == name and p["host"] == (host or "")]),
+                            "value": value if isinstance(value, dict) else {"value": value}, "text": text})
+
+    def ingest_file(self, name: str, text: str) -> None:
+        parts = name.split("/")
+        host = ""
+        rel = name
+        if parts[0] == "hosts" and len(parts) >= 3:
+            host, rel = parts[1], "/".join(parts[2:])
+        base = rel.split("/")[-1]
+        if name == "probes/probes.json":
+            self.ingest_probes(json.loads(text))
+            return
+        if name in ("MANIFEST.json", "SUPPORT-MANIFEST.json", "README.md", "GETTING-HELP.md"):
+            return
+        if rel.startswith("logs/") and rel.endswith(".log"):
+            self.ingest_log(host, rel, text)
+            return
+        if base == "_summary.tsv":
+            for row in tsv_rows(text):
+                self.probe(host, "bundle", "logs-summary", row)
+            return
+        if base == "host.json":
+            with contextlib.suppress(ValueError):
+                for k, v in json.loads(text).items():
+                    if not isinstance(v, (dict, list)):
+                        self.fact(host, f"host.{k}", v)
+                    elif k == "notes":
+                        for n in v:
+                            self.fact(host, "host.note", n)
+            return
+        if base in ("env.txt", "role-env.txt"):
+            for k, v in kv_lines(text).items():
+                self.fact(host, f"env.{k}", v)
+            return
+        if base == "containers.txt":
+            for row in parse_containers(text):
+                self.probe(host, "bundle", "containers", row)
+            return
+        if base == "events.txt" and not host:
+            for row in parse_k8s_events(text, self.collected):
+                self.k8s_events.append(row)
+            return
+        if base == "release.txt":
+            for _title, body in sections("## release\n" + text):
+                for k, v in kv_lines(body).items():
+                    if not k.startswith("#"):
+                        self.fact(host, f"release.{k}", v)
+        # Every other text file: '## section' blocks, tables become rows.
+        stem = re.sub(r"\.txt$", "", rel)
+        for title, body in sections(text):
+            failed = title.endswith("(FAILED)")
+            title = title[:-len("(FAILED)")].strip() if failed else title
+            pname = f"{stem}:{title}" if title else stem
+            if (stem.startswith("vector") and "metrics" in title.lower()) or rel.startswith("vector/"):
+                prom = parse_prometheus(body)
+                if prom:
+                    for row in prom:
+                        self.probe(host, "bundle", pname, row)
+                    continue
+            rows = None if failed else (table_rows(body) or parse_fixed_table(body))
+            if rows:
+                for row in rows:
+                    self.probe(host, "bundle", pname, row)
+            else:
+                self.probe(host, "bundle", pname, {}, ok=not failed and not body.startswith("sh: "),
+                           text=body[:200000])
+            if stem == "host" and title == "host":
+                for k, v in kv_lines(body).items():
+                    self.fact(host, f"host.{k}", v)
+            if stem == "postgres" and title.startswith("install-identity"):
+                for k, v in kv_lines(body).items():
+                    self.fact(host, f"install.{k}", v)
+
+    def ingest_log(self, host: str, rel: str, text: str) -> None:
+        parts = rel.split("/")
+        previous = rel.endswith(".previous.log")
+        if len(parts) == 3:  # logs/<pod>/<container>.log (Kubernetes)
+            container = parts[1]
+            service = re.sub(r"(\.previous)?\.log$", "", parts[2])
+        else:
+            container = re.sub(r"(\.previous)?\.log$", "", parts[-1])
+            service = guess_service(container)
+        last_ts = None
+        for i, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            rec = parse_log_line(line)
+            if rec["ts"] is None:
+                rec["ts"] = last_ts  # continuation lines (stack traces) keep the last time
+            last_ts = rec["ts"] or last_ts
+            self.logs.append({"host": host or (parts[1] if len(parts) == 3 else ""), "service": service,
+                              "container": container, "ts": rec["ts"], "level": rec["level"],
+                              "target": rec["target"], "message": rec["message"][:16000],
+                              "fields": rec["fields"], "file": rel, "line": i, "previous": 1 if previous else 0})
+
+    def ingest_probes(self, doc: dict) -> None:
+        host = doc.get("host", "")
+        self.fact(host, "probes.collected_utc", doc.get("collected_utc"))
+        for name, res in (doc.get("probes") or {}).items():
+            ok = bool(res.get("ok"))
+            rows = res.get("rows")
+            if rows:
+                for r in rows:
+                    self.probe(host, "live", name, r if isinstance(r, dict) else {"value": r}, ok=ok)
+            else:
+                self.probe(host, "live", name, {"error": res.get("error")} if res.get("error") else {}, ok=ok,
+                           text=str(res.get("text") or "")[:200000])
+
+
+# ------------------------------------------------------------------------------------------------
+# The throwaway ClickHouse
+# ------------------------------------------------------------------------------------------------
+
+SCHEMA = [
+    f"CREATE DATABASE IF NOT EXISTS {CH_DB}",
+    f"""CREATE TABLE IF NOT EXISTS {CH_DB}.logs (
+        bundle LowCardinality(String), host LowCardinality(String), service LowCardinality(String),
+        container LowCardinality(String), ts Nullable(DateTime64(6, 'UTC')), level LowCardinality(String),
+        target String, message String, fields JSON, file String, line UInt32, previous UInt8
+    ) ENGINE = MergeTree ORDER BY (bundle, service, assumeNotNull(ts)) SETTINGS allow_nullable_key = 1""",
+    f"""CREATE TABLE IF NOT EXISTS {CH_DB}.k8s_events (
+        bundle LowCardinality(String), ts Nullable(DateTime64(6, 'UTC')), type LowCardinality(String),
+        reason LowCardinality(String), object String, message String, raw String
+    ) ENGINE = MergeTree ORDER BY (bundle, reason)""",
+    f"""CREATE TABLE IF NOT EXISTS {CH_DB}.facts (
+        bundle LowCardinality(String), host LowCardinality(String), key String, value String
+    ) ENGINE = MergeTree ORDER BY (bundle, key)""",
+    f"""CREATE TABLE IF NOT EXISTS {CH_DB}.probes (
+        bundle LowCardinality(String), host LowCardinality(String), source LowCardinality(String),
+        name LowCardinality(String), ok UInt8, row UInt32, value JSON, text String
+    ) ENGINE = MergeTree ORDER BY (bundle, name, row)""",
+]
+
+
+# JSON paths are Dynamic: let people sort and group by them without casting every time.
+QUERY_SETTINGS = {"allow_suspicious_types_in_order_by": "1", "allow_suspicious_types_in_group_by": "1"}
+
+
+class LocalCH:
+    def __init__(self):
+        self.dir = state_dir()
+        self.state_path = os.path.join(self.dir, "state.json")
+        self.pw_path = os.path.join(self.dir, "clickhouse.password")
+        self.env_path = os.path.join(self.dir, "clickhouse.env")
+        self.state = {}
+        if os.path.isfile(self.state_path):
+            with open(self.state_path, encoding="utf-8") as fh:
+                self.state = json.load(fh)
+
+    @property
+    def password(self) -> str:
+        with open(self.pw_path, encoding="utf-8") as fh:
+            return fh.read().strip()
+
+    def running(self) -> bool:
+        name = self.state.get("container")
+        if not name:
+            return False
+        rc, out, _ = run(["docker", "inspect", "--format", "{{.State.Running}}", name], timeout=20)
+        return rc == 0 and out.strip() == "true"
+
+    def up(self) -> None:
+        if self.running():
+            return
+        if shutil.which("docker") is None:
+            die("docker is not installed (load needs Docker to run a throwaway ClickHouse)")
+        rc, _, err = run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
+        if rc != 0:
+            die(f"docker is not running: {err.strip()[:200]}")
+        image = os.environ.get(CH_IMAGE_ENV) or CH_IMAGE
+        name = f"nano-support-ch-{secrets.token_hex(3)}"
+        port = free_port()
+        password = secrets.token_urlsafe(24)
+        write_private(self.pw_path, password + "\n")
+        # Credentials go in a 0600 env file, not on the command line.
+        write_private(self.env_path, f"CLICKHOUSE_USER={CH_USER}\nCLICKHOUSE_PASSWORD={password}\n"
+                                     "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=0\nCLICKHOUSE_DB=support\n")
+        eprint(f"Starting a throwaway ClickHouse ({image.split('@')[0]}) on 127.0.0.1:{port} ...")
+        rc, out, err = run(["docker", "run", "-d", "--name", name, "--label", "nano-support=1",
+                            "--env-file", self.env_path, "-p", f"127.0.0.1:{port}:8123",
+                            "--memory", os.environ.get("SUPPORT_CLICKHOUSE_MEMORY", "3g"),
+                            "--ulimit", "nofile=262144:262144", image], timeout=900)
+        if rc != 0:
+            die(f"docker run failed: {err.strip()[:400]}")
+        self.state = {"container": name, "port": port, "image": image, "created_utc": utc_now(), "bundles": []}
+        self.save()
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            with contextlib.suppress(Exception):
+                if self.sql("SELECT 1").strip() == "1":
+                    break
+            time.sleep(1)
+        else:
+            die(f"ClickHouse did not become ready; see: docker logs {name}")
+        for ddl in SCHEMA:
+            self.sql(ddl)
+
+    def save(self) -> None:
+        write_private(self.state_path, json.dumps(self.state, indent=2) + "\n")
+
+    def sql(self, query: str, data: bytes | None = None, fmt: str | None = None, readonly: bool = False,
+            timeout: int = 300, query_params: dict | None = None) -> str:
+        params = {"database": CH_DB, "enable_json_type": "1", "date_time_input_format": "best_effort",
+                  "input_format_skip_unknown_fields": "1", "output_format_json_quote_64bit_integers": "0",
+                  **QUERY_SETTINGS}
+        if fmt:
+            params["default_format"] = fmt
+        if readonly:
+            params["readonly"] = "2"
+        for k, v in (query_params or {}).items():  # server-side {name:Type} parameters, never spliced
+            # ClickHouse reads parameter values in its escaped (TSV) form: escape \\, tab and newline.
+            params[f"param_{k}"] = str(v).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+        url = f"http://127.0.0.1:{self.state['port']}/?" + urllib.parse.urlencode(params)
+        body = query.encode() if data is None else data
+        if data is not None:
+            url += "&" + urllib.parse.urlencode({"query": query})
+        auth = base64.b64encode(f"{CH_USER}:{self.password}".encode()).decode()
+        req = urllib.request.Request(url, data=body, method="POST", headers={"Authorization": "Basic " + auth})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as err:
+            raise RuntimeError(err.read().decode("utf-8", "replace").strip()) from None
+
+    def insert(self, table: str, rows: list, bundle: str) -> int:
+        if not rows:
+            return 0
+        sent = 0
+        for i in range(0, len(rows), 20000):
+            chunk = rows[i:i + 20000]
+            body = "\n".join(json.dumps({"bundle": bundle, **r}, default=str) for r in chunk).encode()
+            self.sql(f"INSERT INTO {CH_DB}.{table} FORMAT JSONEachRow", data=body)
+            sent += len(chunk)
+        return sent
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+STARTER_QUERIES = """\
+Starter queries (support query "<sql>"; the full playbook is in the nano-support-investigate skill):
+
+  -- What is in it
+  SELECT key, value FROM facts WHERE key IN ('manifest.version', 'manifest.edition', 'manifest.mode',
+         'manifest.created_utc', 'manifest.since_seconds') OR key LIKE 'manifest.note%'
+  -- Restarts and OOM kills
+  SELECT host, value.container AS container, value.restarts AS restarts, value.oom_killed AS oom,
+         value.exit_code AS exit FROM probes WHERE name = 'containers' ORDER BY restarts DESC
+  -- Error clusters (numbers and ids folded so repeats group together)
+  SELECT service, level, count() AS n, min(ts) AS first, max(ts) AS last,
+         any(message) AS example FROM logs WHERE level IN ('ERROR', 'FATAL', 'WARN')
+         GROUP BY service, level, replaceRegexpAll(message, '[0-9a-f]{8,}|\\\\d+', '#') AS shape
+         ORDER BY n DESC LIMIT 30
+  -- Timeline of errors per 5 minutes
+  SELECT toStartOfFiveMinutes(ts) AS t, service, countIf(level IN ('ERROR','FATAL')) AS errors
+         FROM logs GROUP BY t, service HAVING errors > 0 ORDER BY t
+  -- ClickHouse error codes
+  SELECT value.name AS name, value.code AS code, value.value AS count, value.last_error_time AS last
+         FROM probes WHERE name LIKE 'clickhouse%errors-recent' OR name = 'ch-errors' ORDER BY last DESC
+"""
+
+
+def cmd_load(args) -> int:
+    for p in args.bundles:
+        if not os.path.exists(p):
+            die(f"{p} does not exist")
+    ch = LocalCH()
+    ch.up()
+    if args.replace:
+        for t in ("logs", "k8s_events", "facts", "probes"):
+            ch.sql(f"TRUNCATE TABLE {CH_DB}.{t}")
+        ch.state["bundles"] = []
+    for path in args.bundles:
+        try:
+            b = Bundle.from_path(path)
+        except BundleError as err:
+            die(f"{path}: {err}")
+        if b.label in ch.state.get("bundles", []):
+            for t in ("logs", "k8s_events", "facts", "probes"):
+                ch.sql(f"ALTER TABLE {CH_DB}.{t} DELETE WHERE bundle = {{bundle:String}} SETTINGS mutations_sync = 1",
+                       query_params={"bundle": b.label})
+        n = {t: ch.insert(t, getattr(b, t), b.label) for t in ("logs", "k8s_events", "facts", "probes")}
+        ch.state.setdefault("bundles", [])
+        if b.label not in ch.state["bundles"]:
+            ch.state["bundles"].append(b.label)
+        ch.save()
+        print(f"Loaded {b.label}: {n['logs']} log lines, {n['k8s_events']} k8s events, {n['facts']} facts, "
+              f"{n['probes']} probe rows.")
+        for note in b.notes[:10]:
+            print(f"  note: {note}")
+    print(f"\nClickHouse on 127.0.0.1:{ch.state['port']} (database {CH_DB}, user {CH_USER}, "
+          f"password in {ch.pw_path}). Remove it with: support down\n")
+    print(STARTER_QUERIES)
+    return 0
+
+
+def cmd_query(args) -> int:
+    ch = LocalCH()
+    if not ch.running():
+        die("no ClickHouse is running: support load BUNDLE first")
+    if args.recipe:
+        q = recipe_sql(args.recipe, args.recipes)
+        if args.sql:
+            die("give SQL or --recipe, not both")
+    elif not args.sql:
+        die("give SQL text, @file.sql, - for stdin, or --recipe NAME (support recipes lists them)")
+    else:
+        q = args.sql
+    if q == "-":
+        q = sys.stdin.read()
+    elif q.startswith("@"):
+        with open(q[1:], encoding="utf-8") as fh:
+            q = fh.read()
+    statements = [s.strip() for s in split_sql(q) if s.strip()]
+    rc = 0
+    for s in statements:
+        try:
+            sys.stdout.write(ch.sql(s, fmt=args.format, readonly=True))
+        except RuntimeError as err:
+            eprint(f"query failed: {str(err)[:2000]}")
+            rc = 1
+    return rc
+
+
+RECIPES_REL = ("../references/queries.sql",                                  # inside a skill's scripts/
+               "../skills/nano-support-investigate/references/queries.sql")   # the repository's bin/
+
+
+def recipes_file(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("SUPPORT_RECIPES")
+    if env:
+        return env
+    here = os.path.dirname(os.path.realpath(__file__))
+    for rel in RECIPES_REL:
+        p = os.path.normpath(os.path.join(here, rel))
+        if os.path.isfile(p):
+            return p
+    die("no recipes file found: pass --recipes PATH (skills/nano-support-investigate/references/queries.sql)")
+    return ""
+
+
+def parse_recipes(text: str) -> dict:
+    """'-- name: x' / '-- what: ...' headed blocks into {name: {"what": str, "sql": str}}."""
+    out: dict = {}
+    cur = None
+    for line in text.splitlines():
+        m = re.match(r"^--\s*name:\s*([a-z0-9][a-z0-9-]*)\s*$", line)
+        if m:
+            cur = m.group(1)
+            out[cur] = {"what": "", "sql": ""}
+            continue
+        if cur is None:
+            continue
+        w = re.match(r"^--\s*what:\s*(.*)$", line)
+        if w and not out[cur]["sql"].strip():
+            out[cur]["what"] += (" " if out[cur]["what"] else "") + w.group(1).strip()
+            continue
+        out[cur]["sql"] += line + "\n"
+    return out
+
+
+def recipe_sql(name: str, explicit: str | None) -> str:
+    with open(recipes_file(explicit), encoding="utf-8") as fh:
+        recipes = parse_recipes(fh.read())
+    if name not in recipes:
+        die(f"no recipe {name!r}; known: {', '.join(sorted(recipes))}")
+    return recipes[name]["sql"]
+
+
+def cmd_recipes(args) -> int:
+    with open(recipes_file(args.recipes), encoding="utf-8") as fh:
+        recipes = parse_recipes(fh.read())
+    width = max((len(n) for n in recipes), default=10)
+    for name, r in recipes.items():
+        print(f"{name:<{width}}  {r['what']}")
+    return 0
+
+
+def split_sql(text: str) -> list:
+    """Split on ; outside quotes, dropping -- comment lines."""
+    text = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("--"))
+    out, buf, quote = [], [], None
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+        elif ch == ";":
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    out.append("".join(buf))
+    return out
+
+
+def cmd_shell(args) -> int:
+    ch = LocalCH()
+    if not ch.running():
+        die("no ClickHouse is running: support load BUNDLE first")
+    # clickhouse-client inside the container reads CLICKHOUSE_USER / CLICKHOUSE_PASSWORD from its env.
+    return subprocess.call(["docker", "exec", "-it", ch.state["container"], "clickhouse-client",
+                            "--database", CH_DB, "--readonly", "2",
+                            *[f"--{k}={v}" for k, v in QUERY_SETTINGS.items()]])
+
+
+def cmd_status(args) -> int:
+    ch = LocalCH()
+    if not ch.state:
+        print("No throwaway ClickHouse (run: support load BUNDLE).")
+        return 0
+    print(json.dumps({**ch.state, "running": ch.running(), "password_file": ch.pw_path}, indent=2))
+    return 0
+
+
+def cmd_down(args) -> int:
+    ch = LocalCH()
+    name = ch.state.get("container")
+    if name:
+        rc, _, err = run(["docker", "rm", "-f", "-v", name], timeout=120)
+        print(f"Removed {name} and its data." if rc == 0 else f"docker rm failed: {err.strip()[:200]}")
+    for p in (ch.state_path, ch.pw_path, ch.env_path):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(p)
+    if not name:
+        print("Nothing to remove.")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="support", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"support {TOOL_VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("collect", help="collect a redacted bundle (preview and consent before writing)")
+    c.add_argument("--install-dir", help="Compose install directory (default ~/nano)")
+    c.add_argument("--ssh", help="collect a Compose install over ssh: USER@HOST")
+    c.add_argument("--ssh-port", type=int)
+    c.add_argument("--ssh-identity", help="ssh private key file (default: your ssh agent and config)")
+    c.add_argument("--ssh-option", action="append", help="extra ssh -o Name=value (repeatable)")
+    c.add_argument("--kubernetes", action="store_true", help="collect a Helm install with kubectl")
+    c.add_argument("--namespace", default="nano")
+    c.add_argument("--release", default="nano")
+    c.add_argument("--context", help="kubectl context")
+    c.add_argument("--bundle-tool", help="path to nano-support-bundle (Kubernetes: from the pulled chart)")
+    c.add_argument("--since", type=parse_since, default=parse_since("24h"), help="window, e.g. 90m, 24h, 3d")
+    c.add_argument("--local-only", action="store_true", help="role split: this host only")
+    c.add_argument("--no-probes", action="store_true", help="only nano's own bundle, no live probes")
+    c.add_argument("--out-dir", help="where to write the final file (default: current directory)")
+    c.add_argument("--yes", action="store_true", help="answer yes to the prompts (after you reviewed a preview)")
+    c.set_defaults(fn=cmd_collect)
+
+    rc_ = sub.add_parser("_remote-collect", help=argparse.SUPPRESS)
+    rc_.add_argument("--install-dir")
+    rc_.add_argument("--since", type=parse_since, default=parse_since("24h"))
+    rc_.add_argument("--local-only", action="store_true")
+    rc_.add_argument("--no-probes", action="store_true")
+    rc_.set_defaults(fn=cmd_remote_collect)
+
+    p = sub.add_parser("_probe", help=argparse.SUPPRESS)
+    p.add_argument("--install-dir")
+    p.add_argument("--since", type=parse_since, default=parse_since("24h"))
+    p.set_defaults(fn=cmd_probe_internal)
+
+    l = sub.add_parser("load", help="load bundles into a throwaway local ClickHouse")
+    l.add_argument("bundles", nargs="+")
+    l.add_argument("--replace", action="store_true", help="drop previously loaded bundles first")
+    l.set_defaults(fn=cmd_load)
+
+    q = sub.add_parser("query", help="run read-only SQL against the loaded bundles")
+    q.add_argument("sql", nargs="?", help='SQL text, @file.sql, or - for stdin')
+    q.add_argument("--recipe", help="run a named query from the playbook (see: support recipes)")
+    q.add_argument("--recipes", help="recipes file (default: the nano-support-investigate skill's queries.sql)")
+    q.add_argument("--format", default="PrettyCompactMonoBlock",
+                   help="ClickHouse output format (TSVWithNames, JSONEachRow, Vertical, ...)")
+    q.set_defaults(fn=cmd_query)
+
+    r = sub.add_parser("recipes", help="list the named playbook queries")
+    r.add_argument("--recipes", help="recipes file")
+    r.set_defaults(fn=cmd_recipes)
+
+    sub.add_parser("shell", help="clickhouse-client on the loaded bundles").set_defaults(fn=cmd_shell)
+    sub.add_parser("status", help="show the throwaway ClickHouse").set_defaults(fn=cmd_status)
+    sub.add_parser("down", help="remove the throwaway ClickHouse and its data").set_defaults(fn=cmd_down)
+
+    k = sub.add_parser("check", help="scan bundles for text nano's redactor would still change")
+    k.add_argument("bundles", nargs="+")
+    k.add_argument("--bundle-tool", help="nano-support-bundle path (or SUPPORT_BUNDLE_TOOL)")
+    k.set_defaults(fn=cmd_check)
+
+    args = ap.parse_args(argv)
+    if getattr(args, "kubernetes", False) and getattr(args, "ssh", None):
+        ap.error("--kubernetes and --ssh are different install types: pick one")
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

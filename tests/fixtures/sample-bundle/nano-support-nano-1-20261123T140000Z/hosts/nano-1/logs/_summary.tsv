@@ -1,0 +1,9 @@
+container	service	bytes_seen	bytes_kept	truncated	filter
+nano-api	nano-api	120000	2400	no	full, SQL literals and search text removed
+nano-vector	vector	40000	900	no	warn/error only, payload removed
+nano-clickhouse	clickhouse	10000	600	no	warn/error only, payload removed
+nano-jobs	nano-jobs	30000	800	no	full, SQL literals and search text removed
+nano-search	nano-search	30000	800	no	full, SQL literals and search text removed
+nano-postgres	postgres	3000	300	no	full, SQL literals and search text removed
+
+not collected (prints customer events): nano-vector-tap
